@@ -138,9 +138,14 @@ frontend/ (Vue 3 + Vue Flow + Pinia + Tailwind)      backend/ (Go + gin)
 
 ### Finding things on a big canvas
 
-The filter box (top-left of the canvas, or press <kbd>/</kbd>) matches case-insensitively, by
-substring, on the fields that actually identify each kind — plus the Kong uuid, which everything
-has:
+The filter sits collapsed in the top-left corner as a single field — a magnifier and a text box,
+nothing else. Clicking it (or pressing <kbd>/</kbd> anywhere on the canvas) unfolds the kind chips,
+the match counter and the result list; clicking back on the canvas folds it away again while the
+filter keeps running, with a small badge showing how many nodes still match so a dimmed canvas is
+never unexplained.
+
+It matches case-insensitively, by substring, on the fields that actually identify each kind — plus
+the Kong uuid, which everything has:
 
 | Kind | Searched |
 |---|---|
