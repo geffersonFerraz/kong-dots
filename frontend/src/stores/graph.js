@@ -77,7 +77,7 @@ export const useGraphStore = defineStore('graph', {
       const out = new Set()
       for (const node of this.allNodes) {
         if (kinds.length && !kinds.includes(node.data.kind)) continue
-        if (query && !matchesQuery(node.data.entity, query)) continue
+        if (query && !matchesQuery(node.data.kind, node.data.entity, query)) continue
         out.add(node.id)
       }
       return out
@@ -93,6 +93,7 @@ export const useGraphStore = defineStore('graph', {
           nodeId: n.id,
           kind: n.data.kind,
           label: entityLabel(n.data.kind, n.data.entity),
+          detail: describeEntity(n.data.kind, n.data.entity),
           entityId: n.data.entity.id,
           draft: n.data.draft,
         }))
@@ -603,12 +604,29 @@ function appliedKeys(ops, results, idMap) {
   return out
 }
 
-// matchesQuery searches the fields a user would type: the entity name (whatever
-// the kind calls it) and the Kong uuid, both as case-insensitive substrings.
-function matchesQuery(entity, query) {
-  for (const key of ['name', 'username', 'target', 'id']) {
+// describeEntity renders the same one-line summary the node shows, so a result
+// row makes it obvious which host or path matched.
+function describeEntity(kind, entity) {
+  try {
+    return KIND_META[kind]?.subtitle?.(entity) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+// matchesQuery searches the fields a user would actually type for that kind —
+// a Service by host, a Route by path — plus the Kong uuid, which every entity
+// has. Matching is case-insensitive and by substring; list fields match when
+// any of their entries does.
+function matchesQuery(kind, entity, query) {
+  if (typeof entity?.id === 'string' && entity.id.toLowerCase().includes(query)) return true
+  for (const key of KIND_META[kind]?.searchFields ?? ['name']) {
     const value = entity?.[key]
-    if (typeof value === 'string' && value.toLowerCase().includes(query)) return true
+    if (typeof value === 'string') {
+      if (value.toLowerCase().includes(query)) return true
+    } else if (Array.isArray(value)) {
+      if (value.some((v) => typeof v === 'string' && v.toLowerCase().includes(query))) return true
+    }
   }
   return false
 }

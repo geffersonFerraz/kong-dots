@@ -47,7 +47,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           ref="input"
           :value="graph.filter.query"
           class="w-full bg-transparent text-slate-100 placeholder:text-slate-500 focus:outline-none"
-          placeholder="Filter by name or uuid…"
+          placeholder="Filter by name, host, path or uuid…"
           @input="graph.setFilter({ query: $event.target.value }); showResults = true"
           @focus="showResults = true"
           @keydown.esc="graph.clearFilter(); showResults = false"
@@ -104,8 +104,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <li v-for="r in results.slice(0, 50)" :key="r.nodeId">
           <button class="flex w-full items-center gap-2 px-2.5 py-1 text-left hover:bg-[#222835]" @click="pick(r)">
             <span class="h-1.5 w-1.5 shrink-0 rounded-full" :style="{ backgroundColor: KIND_META[r.kind].accent }" />
-            <span class="truncate text-slate-200">{{ r.label }}</span>
-            <span class="ml-auto shrink-0 font-mono text-[10px] text-slate-600">
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-slate-200">{{ r.label }}</span>
+              <span v-if="r.detail" class="block truncate text-[10px] text-slate-500">{{ r.detail }}</span>
+            </span>
+            <span class="shrink-0 self-start font-mono text-[10px] text-slate-600">
               {{ r.draft ? 'new' : String(r.entityId).slice(0, 8) }}
             </span>
           </button>

@@ -138,13 +138,27 @@ frontend/ (Vue 3 + Vue Flow + Pinia + Tailwind)      backend/ (Go + gin)
 
 ### Finding things on a big canvas
 
-The filter box (top-left of the canvas, or press <kbd>/</kbd>) matches the **entity name and its
-Kong uuid**, case-insensitively and by substring, and the kind chips narrow it to Services, Routes,
-Plugins, Consumers, Upstreams or Targets. Matches stay lit while everything else fades, so the
-surrounding topology is still readable; **Hide the rest** removes the non-matching nodes (and any
-edge that would dangle) when the graph is too dense. Results are listed with their short uuid —
-clicking one selects and recentres it. Filtering is purely a view: it never changes what an apply
-sends to Kong.
+The filter box (top-left of the canvas, or press <kbd>/</kbd>) matches case-insensitively, by
+substring, on the fields that actually identify each kind — plus the Kong uuid, which everything
+has:
+
+| Kind | Searched |
+|---|---|
+| Service | name, **host** |
+| Route | name, **paths**, hosts, methods |
+| Plugin | name |
+| Consumer | username, custom_id |
+| Upstream | name |
+| Target | target address |
+
+So `/payments/status` finds the Route serving it, and `payments-pool` finds both the Upstream of
+that name and the Service pointing at it. List fields match on any entry, so one path out of five
+is enough. The kind chips narrow the search further.
+
+Matches stay lit while everything else fades, so the surrounding topology is still readable;
+**Hide the rest** removes the non-matching nodes (and any edge that would dangle) when the graph is
+too dense. Each result is listed with what matched and its short uuid — clicking one selects and
+recentres it. Filtering is purely a view: it never changes what an apply sends to Kong.
 
 ![filter](docs/filter.png)
 

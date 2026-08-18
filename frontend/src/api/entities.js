@@ -12,6 +12,7 @@ export const KIND_META = {
     singular: 'Service',
     accent: '#34d399',
     labelField: 'name',
+    searchFields: ['name', 'host'],
     subtitle: (e) => `${e.protocol ?? 'http'}://${e.host ?? '?'}:${e.port ?? 80}${e.path ?? ''}`,
     defaults: () => ({ name: '', protocol: 'http', host: '', port: 80, path: '', retries: 5, connect_timeout: 60000, write_timeout: 60000, read_timeout: 60000, enabled: true, tags: [] }),
     fields: [
@@ -32,6 +33,7 @@ export const KIND_META = {
     singular: 'Route',
     accent: '#38bdf8',
     labelField: 'name',
+    searchFields: ['name', 'paths', 'hosts', 'methods'],
     subtitle: (e) => [(e.methods ?? []).join('|'), (e.paths ?? []).join(', ')].filter(Boolean).join(' ') || '(no matcher)',
     defaults: () => ({ name: '', protocols: ['http', 'https'], methods: [], hosts: [], paths: ['/'], strip_path: true, preserve_host: false, https_redirect_status_code: 426, path_handling: 'v0', request_buffering: true, response_buffering: true, tags: [] }),
     fields: [
@@ -51,6 +53,7 @@ export const KIND_META = {
     singular: 'Plugin',
     accent: '#a78bfa',
     labelField: 'name',
+    searchFields: ['name'],
     subtitle: (e) => (e.enabled === false ? 'disabled' : 'enabled'),
     defaults: () => ({ name: '', enabled: true, protocols: ['grpc', 'grpcs', 'http', 'https'], config: {}, tags: [] }),
     fields: [
@@ -64,6 +67,7 @@ export const KIND_META = {
     singular: 'Consumer',
     accent: '#fbbf24',
     labelField: 'username',
+    searchFields: ['username', 'custom_id'],
     subtitle: (e) => e.custom_id || e.username || '',
     defaults: () => ({ username: '', custom_id: '', tags: [] }),
     fields: [
@@ -76,6 +80,7 @@ export const KIND_META = {
     singular: 'Upstream',
     accent: '#fb7185',
     labelField: 'name',
+    searchFields: ['name'],
     subtitle: (e) => e.algorithm ?? 'round-robin',
     defaults: () => ({ name: '', algorithm: 'round-robin', slots: 10000, tags: [] }),
     fields: [
@@ -89,6 +94,7 @@ export const KIND_META = {
     singular: 'Target',
     accent: '#94a3b8',
     labelField: 'target',
+    searchFields: ['target'],
     subtitle: (e) => `weight ${e.weight ?? 100}`,
     defaults: () => ({ target: '', weight: 100, tags: [] }),
     fields: [

@@ -304,6 +304,61 @@ describe('canvas filter', () => {
     expect(graph.filterResults).toEqual([])
   })
 
+  it('matches a Service by its host', async () => {
+    const graph = await freshStore()
+    graph.setFilter({ query: 'billing.internal' })
+    expect(graph.filterResults.map((r) => r.nodeId)).toEqual(['services:svc-1'])
+
+    // a partial host is enough, and it does not drag in same-named entities
+    graph.setFilter({ query: '.internal' })
+    expect(graph.filterResults.map((r) => r.nodeId)).toEqual(['services:svc-1'])
+  })
+
+  it('matches a Route by its path', async () => {
+    const graph = await freshStore()
+    graph.setFilter({ query: '/invoices' })
+    expect(graph.filterResults.map((r) => r.nodeId)).toEqual(['routes:rt-1'])
+
+    graph.setFilter({ query: 'invoic' })
+    expect(graph.filterResults.map((r) => r.nodeId)).toEqual(['routes:rt-1'])
+  })
+
+  it('matches any entry of a list field, and Route hosts and methods too', async () => {
+    const graph = await freshStore({
+      ...LIVE,
+      routes: [
+        {
+          id: 'rt-1',
+          name: 'multi',
+          paths: ['/a', '/deep/second'],
+          hosts: ['api.example.com'],
+          methods: ['GET', 'PATCH'],
+          service: { id: 'svc-1' },
+        },
+      ],
+    })
+    for (const query of ['/deep/second', 'api.example.com', 'patch']) {
+      graph.setFilter({ query })
+      expect(graph.filterResults.map((r) => r.nodeId), `query ${query}`).toEqual(['routes:rt-1'])
+    }
+  })
+
+  it('does not search fields that belong to another kind', async () => {
+    // "billing.internal" is a Service host; no Route should answer to it.
+    const graph = await freshStore()
+    graph.setFilter({ query: 'billing.internal', kinds: ['routes'] })
+    expect(graph.filterResults).toEqual([])
+  })
+
+  it('shows what matched next to each result', async () => {
+    const graph = await freshStore()
+    graph.setFilter({ query: 'billing.internal' })
+    expect(graph.filterResults[0].detail).toContain('billing.internal')
+
+    graph.setFilter({ query: '/invoices' })
+    expect(graph.filterResults[0].detail).toContain('/invoices')
+  })
+
   it('matches consumers by username and targets by address', async () => {
     const graph = await freshStore()
     graph.setFilter({ query: 'mobile' })
