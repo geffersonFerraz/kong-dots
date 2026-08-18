@@ -188,12 +188,14 @@ re-layout; on a node it offers edit, duplicate and delete; on an edge it offers 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/context-menu-canvas.png" alt="Right-click on the canvas: add Service, Route, Plugin, Consumer, Upstream, Target, or auto-layout"></td>
-<td width="50%"><img src="docs/context-menu-node.png" alt="Right-click on a node: edit properties, duplicate, delete"></td>
+<td width="33%"><img src="docs/context-menu-canvas.png" alt="Right-click on the canvas: add Service, Route, Plugin, Consumer, Upstream, Target, or auto-layout"></td>
+<td width="33%"><img src="docs/context-menu-node.png" alt="Right-click on a node: edit properties, duplicate, delete"></td>
+<td width="33%"><img src="docs/context-menu-edge.png" alt="Right-click on the edge between a Service and a Route: disconnect"></td>
 </tr>
 <tr>
 <td><em>On empty canvas — a new node is placed where you clicked.</em></td>
 <td><em>On a node — the delete confirms first, listing what cascades with it.</em></td>
+<td><em>On an edge — disconnecting clears the foreign key behind it, here <code>route.service</code>.</em></td>
 </tr>
 </table>
 
