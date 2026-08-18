@@ -1,0 +1,87 @@
+# Self-contained demo stack: Kong 3.9.1 + Postgres, seeded with a topology whose
+# routes answer with canned JSON (request-termination), plus Kong Dots itself.
+#
+#   make demo         Kong + demo data + the Kong Dots UI on :8080
+#   make demo-kong    only Kong + demo data (for `make api` / `make ui`)
+#   make demo-down    tear everything down, including volumes
+#
+# Every published port is bound to loopback.
+name: kong-dots-demo
+
+services:
+  kong-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kong
+      POSTGRES_DB: kong
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kong"]
+      interval: 3s
+      retries: 20
+
+  kong-migrations:
+    image: kong:3.9.1
+    command: kong migrations bootstrap
+    depends_on:
+      kong-db:
+        condition: service_healthy
+    environment: &kong-env
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-db
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+    restart: on-failure
+
+  kong:
+    image: kong:3.9.1
+    depends_on:
+      kong-migrations:
+        condition: service_completed_successfully
+    environment:
+      <<: *kong-env
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:${KONG_PROXY_PORT:-8000}:8000"
+      - "127.0.0.1:${KONG_ADMIN_PORT:-8001}:8001"
+
+  # Creates the demo topology and, when the UI container is running, registers
+  # this Kong as a workspace so the canvas is populated on first load.
+  demo-seed:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      kong:
+        condition: service_healthy
+    environment:
+      KONG_ADMIN: http://kong:8001
+      DOTS_API: http://kong-dots:8080
+    volumes:
+      - ./seed-demo.sh:/seed-demo.sh:ro
+    entrypoint: ["sh", "/seed-demo.sh"]
+    restart: on-failure
+
+  kong-dots:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: kong-dots:latest
+    profiles: ["app"]
+    depends_on:
+      kong:
+        condition: service_healthy
+    environment:
+      # Demo-only key. In a real deployment set KONGDOTS_SECRET_KEY from your
+      # secret manager — losing it makes stored Admin API credentials unreadable.
+      KONGDOTS_SECRET_KEY: demo-only-not-a-real-secret
+    ports:
+      - "127.0.0.1:${KONGDOTS_PORT:-8080}:8080"
+    volumes:
+      - kong-dots-data:/data
+
+volumes:
+  kong-dots-data:

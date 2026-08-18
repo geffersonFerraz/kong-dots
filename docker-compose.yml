@@ -1,0 +1,19 @@
+services:
+  kong-dots:
+    build: .
+    image: kong-dots:latest
+    restart: unless-stopped
+    ports:
+      # Bound to loopback on purpose: expose it through the same Cloudflare
+      # Tunnel / Zero Trust used by the rest of the infra, never directly.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Set this to a stable value (e.g. from your secret manager). Without it a
+      # key is generated into the data volume on first start.
+      KONGDOTS_SECRET_KEY: ${KONGDOTS_SECRET_KEY:-}
+      KONGDOTS_CORS_ORIGINS: ${KONGDOTS_CORS_ORIGINS:-}
+    volumes:
+      - kong-dots-data:/data
+
+volumes:
+  kong-dots-data:
