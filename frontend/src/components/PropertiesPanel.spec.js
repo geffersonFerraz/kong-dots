@@ -157,14 +157,26 @@ describe('editing through the properties panel', () => {
     expect(graph.entities.routes).toHaveLength(0)
   })
 
-  it('locks the plugin name once Kong has assigned it an id', async () => {
+  it('locks the plugin type once Kong has assigned it an id', async () => {
     const graph = await setup({
       ...EMPTY,
       plugins: [{ id: 'plg-1', name: 'rate-limiting', config: {} }],
     })
     graph.selectedNodeId = 'plugins:plg-1'
     const wrapper = await mountPanel(graph)
-    expect(fieldByLabel(wrapper, 'Plugin').find('input').attributes('disabled')).toBeDefined()
+    expect(fieldByLabel(wrapper, 'Plugin').find('select').attributes('disabled')).toBeDefined()
+  })
+
+  // A plugin's name is the plugin type, so it is chosen from what the gateway
+  // reports rather than typed — a typo there is a mid-apply failure.
+  it('offers the gateway plugin list when the plugin is still a draft', async () => {
+    const graph = await setup({ ...EMPTY })
+    graph.createEntity('plugins', { name: 'rate-limiting' })
+    const wrapper = await mountPanel(graph)
+
+    const select = fieldByLabel(wrapper, 'Plugin').find('select')
+    expect(select.attributes('disabled')).toBeUndefined()
+    expect(select.findAll('option').map((o) => o.text())).toContain('rate-limiting')
   })
 })
 

@@ -11,6 +11,7 @@ const isEdit = computed(() => !!props.connection)
 const form = reactive({
   name: props.connection?.name ?? '',
   admin_api_url: props.connection?.admin_api_url ?? 'http://localhost:8001',
+  base_url: props.connection?.base_url ?? '',
   auth_type: props.connection?.auth_type ?? 'none',
   auth_secret: '',
   auth_header: props.connection?.auth_header ?? '',
@@ -131,6 +132,14 @@ const labelClass = 'block text-[11px] font-medium uppercase tracking-wide text-s
         <label :class="labelClass">
           Admin API URL
           <input v-model="form.admin_api_url" :class="inputClass" placeholder="https://kong.example.com:8444" />
+        </label>
+
+        <label :class="labelClass">
+          Proxy base URL
+          <input v-model="form.base_url" :class="inputClass" placeholder="https://api.example.com (optional)" />
+          <span class="mt-1 block text-[11px] text-slate-500">
+            Where this Kong serves traffic. Used to build the URL a Route answers on, so it can be copied from the canvas.
+          </span>
         </label>
 
         <div class="grid grid-cols-2 gap-3">

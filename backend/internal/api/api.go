@@ -195,6 +195,7 @@ func (s *Server) resolve(c *gin.Context) (*kong.Client, store.Connection, bool) 
 type connectionReq struct {
 	Name        string  `json:"name"`
 	AdminAPIURL string  `json:"admin_api_url"`
+	BaseURL     string  `json:"base_url"`
 	AuthType    string  `json:"auth_type"`
 	AuthSecret  *string `json:"auth_secret"`
 	AuthHeader  string  `json:"auth_header"`
@@ -219,6 +220,12 @@ func (req connectionReq) validate() error {
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return errors.New("admin_api_url must start with http:// or https://")
 	}
+	// The proxy base URL is optional, but a typo there would silently produce
+	// broken Route URLs, so it is checked when present.
+	if b := strings.TrimSpace(req.BaseURL); b != "" &&
+		!strings.HasPrefix(b, "http://") && !strings.HasPrefix(b, "https://") {
+		return errors.New("base_url must start with http:// or https://")
+	}
 	switch req.AuthType {
 	case "", "none", "key", "rbac", "bearer", "basic":
 	case "oauth2":
@@ -241,6 +248,7 @@ func (req connectionReq) toConnection(id, secret, oauthSecret string) store.Conn
 	return store.Connection{
 		ID: id, Name: strings.TrimSpace(req.Name),
 		AdminAPIURL: strings.TrimRight(strings.TrimSpace(req.AdminAPIURL), "/"),
+		BaseURL:     strings.TrimRight(strings.TrimSpace(req.BaseURL), "/"),
 		AuthType:    defaultStr(req.AuthType, "none"), AuthSecret: secret,
 		AuthHeader:    req.AuthHeader,
 		OAuthTokenURL: strings.TrimSpace(req.OAuthTokenURL),

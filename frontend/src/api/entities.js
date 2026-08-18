@@ -12,6 +12,7 @@ export const KIND_META = {
     singular: 'Service',
     accent: '#34d399',
     labelField: 'name',
+    renameOnDuplicate: true,
     searchFields: ['name', 'host'],
     subtitle: (e) => `${e.protocol ?? 'http'}://${e.host ?? '?'}:${e.port ?? 80}${e.path ?? ''}`,
     defaults: () => ({ name: '', protocol: 'http', host: '', port: 80, path: '', retries: 5, connect_timeout: 60000, write_timeout: 60000, read_timeout: 60000, enabled: true, tags: [] }),
@@ -33,6 +34,7 @@ export const KIND_META = {
     singular: 'Route',
     accent: '#38bdf8',
     labelField: 'name',
+    renameOnDuplicate: true,
     searchFields: ['name', 'paths', 'hosts', 'methods'],
     subtitle: (e) => [(e.methods ?? []).join('|'), (e.paths ?? []).join(', ')].filter(Boolean).join(' ') || '(no matcher)',
     defaults: () => ({ name: '', protocols: ['http', 'https'], methods: [], hosts: [], paths: ['/'], strip_path: true, preserve_host: false, https_redirect_status_code: 426, path_handling: 'v0', request_buffering: true, response_buffering: true, tags: [] }),
@@ -57,7 +59,7 @@ export const KIND_META = {
     subtitle: (e) => (e.enabled === false ? 'disabled' : 'enabled'),
     defaults: () => ({ name: '', enabled: true, protocols: ['grpc', 'grpcs', 'http', 'https'], config: {}, tags: [] }),
     fields: [
-      { key: 'name', label: 'Plugin', type: 'text', required: true, readonlyWhenSaved: true },
+      { key: 'name', label: 'Plugin', type: 'select', required: true, readonlyWhenSaved: true, optionsFrom: 'plugins' },
       { key: 'enabled', label: 'Enabled', type: 'boolean' },
       { key: 'protocols', label: 'Protocols', type: 'string-list' },
       { key: 'tags', label: 'Tags', type: 'string-list' },
@@ -67,6 +69,7 @@ export const KIND_META = {
     singular: 'Consumer',
     accent: '#fbbf24',
     labelField: 'username',
+    renameOnDuplicate: true,
     searchFields: ['username', 'custom_id'],
     subtitle: (e) => e.custom_id || e.username || '',
     defaults: () => ({ username: '', custom_id: '', tags: [] }),
@@ -80,6 +83,7 @@ export const KIND_META = {
     singular: 'Upstream',
     accent: '#fb7185',
     labelField: 'name',
+    renameOnDuplicate: true,
     searchFields: ['name'],
     subtitle: (e) => e.algorithm ?? 'round-robin',
     defaults: () => ({ name: '', algorithm: 'round-robin', slots: 10000, tags: [] }),
@@ -172,6 +176,66 @@ export function validateEntity(kind, entity) {
       break
   }
   return issues
+}
+
+// Kong's own uniqueness constraints, expressed as the key it enforces. Two
+// entities sharing a key are exactly the 409 the Admin API would answer with.
+export function uniqueKeys(kind, entity) {
+  switch (kind) {
+    case 'services':
+    case 'routes':
+    case 'upstreams':
+      return entity?.name ? [{ key: `${kind}:name:${entity.name}`, field: 'name', what: 'name' }] : []
+    case 'consumers': {
+      const keys = []
+      if (entity?.username) keys.push({ key: `consumers:username:${entity.username}`, field: 'username', what: 'username' })
+      if (entity?.custom_id) keys.push({ key: `consumers:custom_id:${entity.custom_id}`, field: 'custom_id', what: 'custom ID' })
+      return keys
+    }
+    case 'plugins': {
+      if (!entity?.name) return []
+      // One plugin of each type per scope, the scope being a Service, a Route,
+      // a Consumer — or nothing at all, which is global.
+      const scope = ['service', 'route', 'consumer'].map((f) => `${f}=${refId(entity, f) ?? ''}`).join('|')
+      return [{ key: `plugins:${entity.name}:${scope}`, field: 'name', what: 'plugin' }]
+    }
+    default:
+      return []
+  }
+}
+
+// Kong 3.x marks a regex path with a leading "~". It cannot yield one concrete
+// URL, so the marker is dropped and what is left is copied as a template.
+const cleanPath = (path) => {
+  const p = String(path ?? '').replace(/^~/, '')
+  return p.startsWith('/') ? p : `/${p}`
+}
+
+// routeUrls builds the public URLs a Route answers on. The connection's base URL
+// wins when set; otherwise the Route's own hosts are used, which is all Kong
+// knows about where it is reachable.
+export function routeUrls(route, baseUrl) {
+  const paths = route?.paths?.length ? route.paths : ['/']
+  const trimmed = String(baseUrl ?? '').trim().replace(/\/+$/, '')
+
+  let origins = []
+  if (trimmed) {
+    origins = [trimmed]
+  } else if (route?.hosts?.length) {
+    const protocols = route.protocols ?? []
+    const scheme = protocols.includes('https') || !protocols.includes('http') ? 'https' : 'http'
+    origins = route.hosts.map((host) => `${scheme}://${host}`)
+  }
+  if (!origins.length) return []
+
+  const urls = []
+  for (const origin of origins) {
+    for (const path of paths) {
+      const url = origin + cleanPath(path)
+      if (!urls.includes(url)) urls.push(url)
+    }
+  }
+  return urls.slice(0, 8)
 }
 
 export function refId(entity, field) {

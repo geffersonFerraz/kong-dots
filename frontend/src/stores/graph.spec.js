@@ -655,3 +655,188 @@ describe('a failed apply keeps the work on the canvas', () => {
     expect(graph.toast.kind).toBe('success')
   })
 })
+
+describe("Kong's uniqueness constraints, caught before the 409", () => {
+  // Duplicating a plugin keeps its type and its scope, which is exactly the
+  // pair Kong refuses. The canvas has to say so instead of failing mid-apply.
+  it('flags a second plugin of the same type on the same scope', async () => {
+    const graph = await freshStore()
+    const copy = graph.createEntity('plugins', {
+      name: 'rate-limiting',
+      config: { minute: 10 },
+      route: { id: 'rt-1' },
+    })
+
+    expect(graph.issues).toHaveLength(1)
+    expect(graph.issues[0]).toMatchObject({ nodeId: `plugins:${copy.id}`, field: 'name' })
+    expect(graph.issues[0].message).toMatch(/Route invoices already has a rate-limiting plugin/i)
+
+    // Moving it to another scope resolves it, which is what the user meant to do.
+    graph.connect('services:svc-1', `plugins:${copy.id}`)
+    expect(graph.issues).toEqual([])
+  })
+
+  it('allows the same plugin type on different scopes, and flags two globals', async () => {
+    const graph = await freshStore()
+    graph.createEntity('plugins', { name: 'key-auth', service: { id: 'svc-1' } })
+    graph.createEntity('plugins', { name: 'key-auth', route: { id: 'rt-1' } })
+    expect(graph.issues).toEqual([])
+
+    graph.createEntity('plugins', { name: 'correlation-id' })
+    graph.createEntity('plugins', { name: 'correlation-id' })
+    expect(graph.issues.map((i) => i.message)).toEqual([
+      expect.stringMatching(/This gateway already has a correlation-id plugin/i),
+      expect.stringMatching(/This gateway already has a correlation-id plugin/i),
+    ])
+  })
+
+  it('flags a name that another Service already uses', async () => {
+    const graph = await freshStore()
+    graph.createEntity('services', { name: 'billing', host: 'other.internal' })
+
+    expect(graph.issues).toHaveLength(1)
+    expect(graph.issues[0].field).toBe('name')
+    expect(graph.issues[0].message).toMatch(/an existing Service already uses the name "billing"/i)
+  })
+
+  it('names the clash as "another new" when both sides are drafts', async () => {
+    const graph = await freshStore()
+    graph.createEntity('routes', { name: 'twin', paths: ['/a'] })
+    graph.createEntity('routes', { name: 'twin', paths: ['/b'] })
+    expect(graph.issues.map((i) => i.message)).toEqual([
+      expect.stringMatching(/another new Route already uses the name "twin"/i),
+      expect.stringMatching(/another new Route already uses the name "twin"/i),
+    ])
+  })
+
+  it('checks a Consumer on both username and custom id', async () => {
+    const graph = await freshStore()
+    const dup = graph.createEntity('consumers', { username: 'mobile-app' })
+    expect(graph.issues.map((i) => i.field)).toEqual(['username'])
+
+    graph.updateEntity('consumers', dup.id, { username: 'other', custom_id: 'app-ios' })
+    expect(graph.issues).toEqual([])
+
+    graph.updateEntity('consumers', dup.id, { custom_id: 'shared' })
+    graph.createEntity('consumers', { username: 'third', custom_id: 'shared' })
+    expect(graph.issues.map((i) => i.field)).toEqual(['custom_id', 'custom_id'])
+  })
+
+  it('does not flag an untouched entity against itself', async () => {
+    const graph = await freshStore()
+    expect(graph.issues).toEqual([])
+
+    // editing something unrelated must not make it collide with its own name
+    graph.updateEntity('services', 'svc-1', { host: 'moved.internal' })
+    expect(graph.issues).toEqual([])
+  })
+
+  it('does not flag against an entity that is being deleted', async () => {
+    const graph = await freshStore()
+    graph.deleteEntity('services', 'svc-1')
+    graph.createEntity('services', { name: 'billing', host: 'new.internal' })
+    expect(graph.issues).toEqual([])
+  })
+})
+
+describe('clipboard — moving work between Kongs', () => {
+  it('bundles a Service with its Routes and every plugin on them', async () => {
+    const graph = await freshStore()
+    const bundle = graph.clipboardBundle('services', 'svc-1')
+
+    expect(bundle.kong_dots).toBe(1)
+    expect(bundle.kind).toBe('services')
+    expect(bundle.label).toBe('billing')
+    expect(bundle.entities.services).toHaveLength(1)
+    expect(bundle.entities.routes).toHaveLength(1)
+    expect(bundle.entities.plugins).toHaveLength(1)
+    expect(bundle.entities.consumers).toHaveLength(0)
+  })
+
+  it('strips the ids of the source Kong, keeping the wiring between members', async () => {
+    const graph = await freshStore()
+    const bundle = graph.clipboardBundle('services', 'svc-1')
+
+    const [svc] = bundle.entities.services
+    const [route] = bundle.entities.routes
+    const [plugin] = bundle.entities.plugins
+
+    for (const e of [svc, route, plugin]) {
+      expect(e.id).toMatch(/^draft:paste-/)
+      expect(e).not.toHaveProperty('created_at')
+      expect(e).not.toHaveProperty('updated_at')
+    }
+    // internal references survive, pointing at the placeholders
+    expect(route.service).toEqual({ id: svc.id })
+    expect(plugin.route).toEqual({ id: route.id })
+    expect(JSON.stringify(bundle)).not.toContain('svc-1')
+  })
+
+  it('drops references that point outside the bundle', async () => {
+    const graph = await freshStore()
+    // a Route on its own: its Service belongs to the Kong being left behind
+    const bundle = graph.clipboardBundle('routes', 'rt-1')
+
+    expect(bundle.entities.routes).toHaveLength(1)
+    expect(bundle.entities.plugins).toHaveLength(1)
+    expect(bundle.entities.routes[0].service).toBeNull()
+    expect(bundle.entities.plugins[0].route).toEqual({ id: bundle.entities.routes[0].id })
+  })
+
+  it('pastes into an empty Kong as drafts, still wired together', async () => {
+    const source = await freshStore()
+    const bundle = source.clipboardBundle('services', 'svc-1')
+
+    // a different workspace, with nothing in it
+    const target = await freshStore({ services: [], routes: [], plugins: [], consumers: [], upstreams: [], targets: [] })
+    const created = target.pasteBundle(bundle, { x: 100, y: 100 })
+
+    expect(created).toMatchObject({ services: 1, routes: 1, plugins: 1 })
+    const svc = target.entities.services[0]
+    const route = target.entities.routes[0]
+    const plugin = target.entities.plugins[0]
+
+    expect(svc.name).toBe('billing')
+    expect(svc.host).toBe('billing.internal')
+    expect(route.service).toEqual({ id: svc.id })
+    expect(plugin.route).toEqual({ id: route.id })
+    expect(plugin.config.minute).toBe(10)
+
+    // everything is pending creation, and nothing carries an id from the source
+    expect(target.pending).toMatchObject({ create: 3, update: 0, delete: 0 })
+    for (const e of [svc, route, plugin]) expect(e.id).toMatch(/^draft:/)
+  })
+
+  it('can be pasted twice without the two copies colliding on ids', async () => {
+    const source = await freshStore()
+    const bundle = source.clipboardBundle('routes', 'rt-1')
+    const target = await freshStore({ services: [], routes: [], plugins: [], consumers: [], upstreams: [], targets: [] })
+
+    target.pasteBundle(bundle, { x: 0, y: 0 })
+    target.pasteBundle(bundle, { x: 400, y: 0 })
+
+    const ids = target.entities.routes.map((r) => r.id)
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+    // ...though Kong's unique name rule is reported, as it would be on apply
+    expect(target.issues.map((i) => i.field)).toContain('name')
+  })
+
+  it('places what it pasted on the canvas and selects it', async () => {
+    const source = await freshStore()
+    const bundle = source.clipboardBundle('services', 'svc-1')
+    const target = await freshStore({ services: [], routes: [], plugins: [], consumers: [], upstreams: [], targets: [] })
+
+    target.pasteBundle(bundle, { x: 500, y: 300 })
+    const svc = target.entities.services[0]
+    expect(target.positions[`services:${svc.id}`]).toEqual({ x: 500, y: 300 })
+    expect(target.selectedNodeId).toBe(`services:${svc.id}`)
+  })
+
+  it('refuses anything that is not one of its own bundles', async () => {
+    const graph = await freshStore()
+    for (const junk of [null, {}, { kong_dots: 2, entities: {} }, { kong_dots: 1 }, 'nope']) {
+      expect(() => graph.pasteBundle(junk)).toThrow(/does not look like/)
+    }
+  })
+})

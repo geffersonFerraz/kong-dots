@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import dagre from '@dagrejs/dagre'
 import { api } from '../api/client'
 import { deepClone } from '../api/clone'
-import { DRAFT_PREFIX, KINDS, KIND_META, PLUGIN_PARENT_FIELD, entityLabel, isDraftId, nodeId, refId, splitNodeId, validateEntity } from '../api/entities'
+import { DRAFT_PREFIX, KINDS, KIND_META, PLUGIN_PARENT_FIELD, entityLabel, isDraftId, nodeId, refId, splitNodeId, uniqueKeys, validateEntity } from '../api/entities'
 
 const NODE_W = 210
 const NODE_H = 76
@@ -210,9 +210,10 @@ export const useGraphStore = defineStore('graph', {
     // than halfway through one.
     issues() {
       const out = []
+      const occupants = this.uniqueKeyOwners
       for (const { type, kind, entity } of this.pendingEntities) {
         if (type === 'delete') continue
-        for (const issue of validateEntity(kind, entity)) {
+        const report = (issue) =>
           out.push({
             nodeId: nodeId(kind, entity.id),
             kind,
@@ -221,6 +222,28 @@ export const useGraphStore = defineStore('graph', {
             field: issue.field,
             message: issue.message,
           })
+
+        validateEntity(kind, entity).forEach(report)
+
+        // Kong enforces uniqueness with a 409 mid-apply; say it here instead.
+        for (const { key, field, what } of uniqueKeys(kind, entity)) {
+          const others = (occupants[key] ?? []).filter((o) => o.id !== entity.id)
+          if (!others.length) continue
+          report({ field, message: this.duplicateMessage(kind, entity, others[0], what) })
+        }
+      }
+      return out
+    },
+
+    // Every entity that claims each uniqueness key, so a collision can name the
+    // entity already holding it.
+    uniqueKeyOwners: (s) => {
+      const out = {}
+      for (const kind of KINDS) {
+        for (const entity of s.entities[kind] ?? []) {
+          for (const { key } of uniqueKeys(kind, entity)) {
+            (out[key] ??= []).push({ id: entity.id, kind, entity })
+          }
         }
       }
       return out
@@ -239,6 +262,32 @@ export const useGraphStore = defineStore('graph', {
   },
 
   actions: {
+    // duplicateMessage explains a uniqueness clash in Kong's own terms.
+    duplicateMessage(kind, entity, other, what) {
+      if (kind !== 'plugins') {
+        const singular = KIND_META[kind].singular
+        const owner = isDraftId(other.id) ? 'another new' : 'an existing'
+        return `${owner} ${singular} already uses the ${what} "${entityLabel(kind, entity)}"`
+      }
+      const scope = this.pluginScopeLabel(entity)
+      return `${scope} already has a ${entity.name} plugin — Kong allows only one of each per scope`
+    },
+
+    // pluginScopeLabel names what a plugin is attached to, for error messages.
+    pluginScopeLabel(plugin) {
+      for (const [field, kind] of [
+        ['service', 'services'],
+        ['route', 'routes'],
+        ['consumer', 'consumers'],
+      ]) {
+        const id = refId(plugin, field)
+        if (!id) continue
+        const parent = (this.entities[kind] ?? []).find((e) => e.id === id)
+        return `${KIND_META[kind].singular} ${parent ? entityLabel(kind, parent) : id}`
+      }
+      return 'This gateway'
+    },
+
     setFilter(patch) {
       this.filter = { ...this.filter, ...patch }
     },
@@ -431,6 +480,84 @@ export const useGraphStore = defineStore('graph', {
       }
     },
 
+    // ---------------------------------------------------------- clipboard
+
+    // clipboardBundle serialises an entity and everything that belongs to it —
+    // a Service carries its Routes and every plugin on them. Ids are replaced by
+    // placeholders and references that point outside the bundle are dropped,
+    // because the target is usually a different Kong where those ids mean
+    // nothing.
+    clipboardBundle(kind, id) {
+      const members = this.cascade(kind, id)
+      const inBundle = new Map(members.map((m) => [`${m.kind}:${m.id}`, m]))
+
+      const idMap = {}
+      members.forEach((m, i) => (idMap[m.id] = `${DRAFT_PREFIX}paste-${i + 1}`))
+
+      const entities = emptyState()
+      for (const member of members) {
+        const source = (this.entities[member.kind] ?? []).find((e) => e.id === member.id)
+        if (!source) continue
+        const copy = {}
+        for (const [key, value] of Object.entries(stripRuntimeFields(source))) copy[key] = deepClone(value)
+        copy.id = idMap[member.id]
+        for (const field of REF_FIELDS) {
+          const ref = refId(copy, field)
+          if (!ref) continue
+          const target = REF_KIND[field]
+          copy[field] = inBundle.has(`${target}:${ref}`) ? { id: idMap[ref] } : null
+        }
+        entities[member.kind].push(copy)
+      }
+
+      const root = (this.entities[kind] ?? []).find((e) => e.id === id)
+      return {
+        kong_dots: 1,
+        kind,
+        label: entityLabel(kind, root),
+        copied_at: new Date().toISOString(),
+        entities,
+      }
+    },
+
+    // pasteBundle turns a bundle back into draft entities. Fresh ids are minted
+    // so the same clipboard can be pasted repeatedly without colliding.
+    pasteBundle(bundle, origin = { x: 80, y: 80 }) {
+      if (!bundle || bundle.kong_dots !== 1 || typeof bundle.entities !== 'object') {
+        throw new Error('that does not look like something copied from Kong Dots')
+      }
+      const idMap = {}
+      for (const kind of KINDS) {
+        for (const entity of bundle.entities[kind] ?? []) {
+          if (entity?.id) idMap[entity.id] = nextDraftId(kind)
+        }
+      }
+
+      const created = {}
+      let column = 0
+      for (const kind of KINDS) {
+        const list = bundle.entities[kind] ?? []
+        if (!list.length) continue
+        list.forEach((entity, row) => {
+          const copy = deepClone(entity)
+          copy.id = idMap[entity.id] ?? nextDraftId(kind)
+          for (const field of REF_FIELDS) {
+            const ref = refId(copy, field)
+            copy[field] = ref && idMap[ref] ? { id: idMap[ref] } : null
+            if (copy[field] === null && !ref) delete copy[field]
+          }
+          this.entities[kind] = [...this.entities[kind], copy]
+          this.setPosition(nodeId(kind, copy.id), { x: origin.x + column * 260, y: origin.y + row * 96 })
+        })
+        created[kind] = list.length
+        column++
+      }
+
+      const first = KINDS.map((k) => (bundle.entities[k] ?? [])[0]).find(Boolean)
+      if (first) this.selectedNodeId = nodeId(KINDS.find((k) => (bundle.entities[k] ?? []).length), idMap[first.id])
+      return created
+    },
+
     discardChanges() {
       this.entities = deepClone(this.baseline)
       this.plan = null
@@ -592,6 +719,9 @@ export const useGraphStore = defineStore('graph', {
 
 // Foreign-key fields that can point at an entity created in the same apply.
 const REF_FIELDS = ['service', 'route', 'consumer', 'upstream']
+
+// Which kind each foreign key points at.
+const REF_KIND = { service: 'services', route: 'routes', consumer: 'consumers', upstream: 'upstreams' }
 
 // appliedKeys collects the entities Kong actually accepted, keyed by the id
 // they now have.

@@ -147,6 +147,28 @@ describe('ConnectionDialog — OAuth2 client credentials', () => {
     expect(wrapper.text()).toContain('invalid_client')
   })
 
+  it('carries the proxy base URL, which Route URLs are built from', async () => {
+    api.createConnection.mockResolvedValue({ id: 'c1' })
+    const wrapper = mountDialog()
+
+    await field(wrapper, 'Name').setValue('prod')
+    await field(wrapper, 'Admin API URL').setValue('https://kong.internal:8444')
+    await field(wrapper, 'Proxy base URL').setValue('https://api.example.com')
+    await buttonNamed(wrapper, 'Save').trigger('click')
+
+    expect(api.createConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ base_url: 'https://api.example.com' }),
+    )
+  })
+
+  it('pre-fills the base URL when editing', async () => {
+    const wrapper = mountDialog({
+      id: 'c1', name: 'prod', admin_api_url: 'https://kong.internal:8444',
+      base_url: 'https://api.example.com', auth_type: 'none',
+    })
+    expect(field(wrapper, 'Proxy base URL').element.value).toBe('https://api.example.com')
+  })
+
   it('still supports the pre-existing auth types', async () => {
     api.createConnection.mockResolvedValue({ id: 'c1' })
     const wrapper = mountDialog()

@@ -19,6 +19,7 @@ Implements the MVP in [SPEC.md](SPEC.md).
 | Dynamic plugin property form from `/schemas/plugins/{name}` | ✅ |
 | Create / edit / delete nodes, drag-to-connect, cascade-aware delete | ✅ |
 | Validation of what Kong requires, before an apply is attempted | ✅ |
+| Copy/paste entities between Kongs through the system clipboard | ✅ |
 | Draft state + `terraform plan`-style diff before touching Kong | ✅ |
 | Apply in dependency order, live progress over WebSocket, apply history | ✅ |
 | Export **and** import decK `kong.yaml` | ✅ |
@@ -35,6 +36,9 @@ Two rules protect the draft:
 * **Nothing incomplete is sent.** A Service with no host, a Route with no matcher, a Target with no
   Upstream — the canvas flags these on the node, in the property panel and in the review panel, and
   refuses to apply until they are resolved, instead of letting Kong reject them mid-run.
+* **Nothing that would collide is sent.** Kong's uniqueness rules are checked upfront too: a name
+  another Service already uses, or a second `key-auth` on a Route that has one. Those are 409s the
+  Admin API would answer with halfway through a run; here they are named before it starts.
 * **A failed apply never costs you work.** Whatever Kong refused or skipped stays on the canvas,
   still wired up and still pending; only what actually succeeded is replaced by Kong's own copy.
 
@@ -201,19 +205,39 @@ that produce it.
 | Upstream → Target | `target.upstream` |
 | Upstream → Service | `service.host = upstream.name` (dashed edge — Kong links these by name) |
 
-Right-click is how everything is created: on empty canvas it offers the six node types and a
-re-layout; on a node it offers edit, duplicate and delete; on an edge it offers disconnect
-(double-clicking an edge does the same).
+Right-click is how everything is created: on empty canvas it offers the six node types, paste and a
+re-layout; on a node it offers edit, copy, duplicate and delete; on an edge it offers disconnect
+(double-clicking an edge does the same). A **Route** additionally offers **Copy URL** — the address
+it actually answers on, one entry per path.
+
+A Plugin's name is the plugin *type*, so it is chosen from the list the gateway reports rather than
+typed, and duplicating one keeps that type instead of inventing a `-copy` variant Kong has never
+heard of. The duplicate lands on the same Service or Route as the original, where Kong only allows
+one plugin of each type — so the canvas says exactly that, and the fix is to drag it onto a
+different one.
+
+### Moving work between Kongs
+
+**Copy** on a node (or <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>C</kbd>) puts it on the **system
+clipboard** as JSON, together with everything that belongs to it: a Service travels with its Routes
+and every plugin on them. <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>V</kbd> on any canvas pastes it back as
+drafts, wired the same way — including in another workspace, another browser window, or a colleague's
+message, since it is ordinary text.
+
+Ids from the source gateway are stripped, and references pointing outside the bundle are dropped:
+copying a Route alone leaves it serviceless in the target, because the Service it belonged to lives
+in a different Kong. Pasting twice is safe — each paste gets its own draft ids — and the usual
+review-then-apply still stands.
 
 <table>
 <tr>
 <td width="33%"><img src="docs/context-menu-canvas.png" alt="Right-click on the canvas: add Service, Route, Plugin, Consumer, Upstream, Target, or auto-layout"></td>
-<td width="33%"><img src="docs/context-menu-node.png" alt="Right-click on a node: edit properties, duplicate, delete"></td>
+<td width="33%"><img src="docs/context-menu-node.png" alt="Right-click on a Route node: copy URL, edit properties, duplicate, delete"></td>
 <td width="33%"><img src="docs/context-menu-edge.png" alt="Right-click on the edge between a Service and a Route: disconnect"></td>
 </tr>
 <tr>
 <td><em>On empty canvas — a new node is placed where you clicked.</em></td>
-<td><em>On a node — the delete confirms first, listing what cascades with it.</em></td>
+<td><em>On a node — a Route also offers its public URL; delete confirms first, listing what cascades.</em></td>
 <td><em>On an edge — disconnecting clears the foreign key behind it, here <code>route.service</code>.</em></td>
 </tr>
 </table>
@@ -222,6 +246,11 @@ re-layout; on a node it offers edit, duplicate and delete; on an edge it offers 
 
 Each registered Kong picks its own scheme: none, an API key header, an Enterprise RBAC token, a
 bearer or basic value, or **OAuth2 client credentials**.
+
+Each connection also carries an optional **proxy base URL** — where that Kong *serves traffic*, as
+opposed to where it is administered. Nothing calls it; it is what turns a Route's `paths` into a
+copyable address (`https://api.example.com` + `/orders`). Without it, Copy URL falls back to the
+Route's own `hosts`, and says so when the Route has none.
 
 ### OAuth2 client credentials
 

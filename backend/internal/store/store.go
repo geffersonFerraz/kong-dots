@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS kong_connections (
   id                    TEXT PRIMARY KEY,
   name                  TEXT NOT NULL,
   admin_api_url         TEXT NOT NULL,
+  base_url              TEXT NOT NULL DEFAULT '',
   auth_type             TEXT NOT NULL DEFAULT 'none',
   auth_secret_encrypted TEXT NOT NULL DEFAULT '',
   auth_header           TEXT NOT NULL DEFAULT '',
@@ -77,6 +78,7 @@ func Open(path string) (*Store, error) {
 // has no "ADD COLUMN IF NOT EXISTS", so existing columns are read first.
 func migrate(db *sql.DB) error {
 	added := map[string]string{
+		"base_url":                      "TEXT NOT NULL DEFAULT ''",
 		"oauth_token_url":               "TEXT NOT NULL DEFAULT ''",
 		"oauth_client_id":               "TEXT NOT NULL DEFAULT ''",
 		"oauth_client_secret_encrypted": "TEXT NOT NULL DEFAULT ''",
@@ -115,9 +117,12 @@ type Connection struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	AdminAPIURL string `json:"admin_api_url"`
-	AuthType    string `json:"auth_type"` // none | key | rbac | basic | bearer
-	AuthSecret  string `json:"auth_secret,omitempty"`
-	AuthHeader  string `json:"auth_header,omitempty"`
+	// BaseURL is where this Kong serves traffic (its proxy), as opposed to where
+	// it is administered. Nothing calls it; the UI uses it to build Route URLs.
+	BaseURL    string `json:"base_url,omitempty"`
+	AuthType   string `json:"auth_type"` // none | key | rbac | basic | bearer | oauth2
+	AuthSecret string `json:"auth_secret,omitempty"`
+	AuthHeader string `json:"auth_header,omitempty"`
 	// OAuth2 client-credentials fields, used when AuthType is "oauth2".
 	OAuthTokenURL     string `json:"oauth_token_url,omitempty"`
 	OAuthClientID     string `json:"oauth_client_id,omitempty"`
@@ -132,7 +137,7 @@ type Connection struct {
 
 func (s *Store) ListConnections(ctx context.Context) ([]Connection, error) {
 	rows, err := s.db.QueryContext(ctx, `
-	  SELECT id,name,admin_api_url,auth_type,auth_secret_encrypted,auth_header,
+	  SELECT id,name,admin_api_url,base_url,auth_type,auth_secret_encrypted,auth_header,
 	         oauth_token_url,oauth_client_id,oauth_client_secret_encrypted,workspace,
 	         environment,tags,tls_skip_verify,created_at,updated_at
 	  FROM kong_connections ORDER BY name`)
@@ -156,7 +161,7 @@ type scanner interface{ Scan(dest ...any) error }
 func scanConn(sc scanner) (Connection, error) {
 	var c Connection
 	var skip int
-	err := sc.Scan(&c.ID, &c.Name, &c.AdminAPIURL, &c.AuthType, &c.AuthSecret, &c.AuthHeader,
+	err := sc.Scan(&c.ID, &c.Name, &c.AdminAPIURL, &c.BaseURL, &c.AuthType, &c.AuthSecret, &c.AuthHeader,
 		&c.OAuthTokenURL, &c.OAuthClientID, &c.OAuthClientSecret,
 		&c.Workspace, &c.Environment, &c.Tags, &skip, &c.CreatedAt, &c.UpdatedAt)
 	c.TLSSkipVerify = skip == 1
@@ -165,7 +170,7 @@ func scanConn(sc scanner) (Connection, error) {
 
 func (s *Store) GetConnection(ctx context.Context, id string) (Connection, error) {
 	row := s.db.QueryRowContext(ctx, `
-	  SELECT id,name,admin_api_url,auth_type,auth_secret_encrypted,auth_header,
+	  SELECT id,name,admin_api_url,base_url,auth_type,auth_secret_encrypted,auth_header,
 	         oauth_token_url,oauth_client_id,oauth_client_secret_encrypted,workspace,
 	         environment,tags,tls_skip_verify,created_at,updated_at
 	  FROM kong_connections WHERE id = ?`, id)
@@ -181,11 +186,11 @@ func (s *Store) CreateConnection(ctx context.Context, c Connection) error {
 	c.CreatedAt, c.UpdatedAt = now, now
 	_, err := s.db.ExecContext(ctx, `
 	  INSERT INTO kong_connections
-	    (id,name,admin_api_url,auth_type,auth_secret_encrypted,auth_header,
+	    (id,name,admin_api_url,base_url,auth_type,auth_secret_encrypted,auth_header,
 	     oauth_token_url,oauth_client_id,oauth_client_secret_encrypted,workspace,
 	     environment,tags,tls_skip_verify,created_at,updated_at)
-	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.Name, c.AdminAPIURL, c.AuthType, c.AuthSecret, c.AuthHeader,
+	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.Name, c.AdminAPIURL, c.BaseURL, c.AuthType, c.AuthSecret, c.AuthHeader,
 		c.OAuthTokenURL, c.OAuthClientID, c.OAuthClientSecret, c.Workspace,
 		c.Environment, c.Tags, b2i(c.TLSSkipVerify), c.CreatedAt, c.UpdatedAt)
 	return err
@@ -193,11 +198,11 @@ func (s *Store) CreateConnection(ctx context.Context, c Connection) error {
 
 func (s *Store) UpdateConnection(ctx context.Context, c Connection) error {
 	res, err := s.db.ExecContext(ctx, `
-	  UPDATE kong_connections SET name=?,admin_api_url=?,auth_type=?,auth_secret_encrypted=?,
+	  UPDATE kong_connections SET name=?,admin_api_url=?,base_url=?,auth_type=?,auth_secret_encrypted=?,
 	    auth_header=?,oauth_token_url=?,oauth_client_id=?,oauth_client_secret_encrypted=?,
 	    workspace=?,environment=?,tags=?,tls_skip_verify=?,updated_at=?
 	  WHERE id=?`,
-		c.Name, c.AdminAPIURL, c.AuthType, c.AuthSecret, c.AuthHeader,
+		c.Name, c.AdminAPIURL, c.BaseURL, c.AuthType, c.AuthSecret, c.AuthHeader,
 		c.OAuthTokenURL, c.OAuthClientID, c.OAuthClientSecret, c.Workspace,
 		c.Environment, c.Tags, b2i(c.TLSSkipVerify), time.Now().UTC().Format(time.RFC3339), c.ID)
 	if err != nil {

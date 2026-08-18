@@ -342,3 +342,49 @@ func TestUnknownConnectionAndEndpoint(t *testing.T) {
 		t.Errorf("healthz should answer 200, got %d", rec.Code)
 	}
 }
+
+func TestBaseURLIsStoredAndValidated(t *testing.T) {
+	h := newTestServer(t)
+	kong := newFakeKong(t)
+
+	rec, body := do(t, h, http.MethodPost, "/api/connections", map[string]any{
+		"name": "prod", "admin_api_url": kong.srv.URL, "base_url": "https://api.example.com/",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	// The trailing slash is trimmed so the UI can concatenate a path safely.
+	if body["base_url"] != "https://api.example.com" {
+		t.Errorf("base_url not normalised: %v", body["base_url"])
+	}
+
+	id := body["id"].(string)
+	rec, body = do(t, h, http.MethodPut, "/api/connections/"+id, map[string]any{
+		"name": "prod", "admin_api_url": kong.srv.URL, "base_url": "https://edge.example.com",
+	})
+	if rec.Code != http.StatusOK || body["base_url"] != "https://edge.example.com" {
+		t.Errorf("base_url not updated: %d %v", rec.Code, body["base_url"])
+	}
+
+	// It is optional...
+	rec, body = do(t, h, http.MethodPost, "/api/connections", map[string]any{
+		"name": "no-base", "admin_api_url": kong.srv.URL,
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("base_url should be optional: %d %s", rec.Code, rec.Body)
+	}
+	if _, present := body["base_url"]; present {
+		t.Errorf("an empty base_url should be omitted, got %v", body["base_url"])
+	}
+
+	// ...but a typo is caught rather than producing broken Route URLs later.
+	rec, body = do(t, h, http.MethodPost, "/api/connections", map[string]any{
+		"name": "bad", "admin_api_url": kong.srv.URL, "base_url": "api.example.com",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a schemeless base_url, got %d", rec.Code)
+	}
+	if !strings.Contains(fmt.Sprint(body["error"]), "base_url") {
+		t.Errorf("error should name the field: %v", body["error"])
+	}
+}

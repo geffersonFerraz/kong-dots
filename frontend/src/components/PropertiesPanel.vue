@@ -57,6 +57,14 @@ const parentRef = computed(() => {
 
 // Validation problems for whatever is selected, keyed by the field they touch.
 const issues = computed(() => graph.issuesByNode[graph.selectedNodeId] ?? [])
+
+// A field can draw its options from the gateway — the plugin list, for one, so
+// a plugin type can never be a typo.
+const fields = computed(() =>
+  (meta.value?.fields ?? []).map((field) =>
+    field.optionsFrom === 'plugins' ? { ...field, options: graph.availablePlugins } : field,
+  ),
+)
 const errorFor = (key) => issues.value.find((i) => i.field === key)?.message ?? ''
 
 function set(key, value) {
@@ -138,7 +146,7 @@ function fieldDisabled(field) {
         </div>
 
         <FieldInput
-          v-for="field in meta.fields"
+          v-for="field in fields"
           :key="field.key"
           :field="field"
           :disabled="fieldDisabled(field)"
