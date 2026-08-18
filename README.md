@@ -182,8 +182,20 @@ that produce it.
 | Upstream → Target | `target.upstream` |
 | Upstream → Service | `service.host = upstream.name` (dashed edge — Kong links these by name) |
 
-Right-click: canvas → add a node or re-run auto-layout; node → edit / duplicate / delete;
-edge → disconnect (double-click works too).
+Right-click is how everything is created: on empty canvas it offers the six node types and a
+re-layout; on a node it offers edit, duplicate and delete; on an edge it offers disconnect
+(double-clicking an edge does the same).
+
+<table>
+<tr>
+<td width="50%"><img src="docs/context-menu-canvas.png" alt="Right-click on the canvas: add Service, Route, Plugin, Consumer, Upstream, Target, or auto-layout"></td>
+<td width="50%"><img src="docs/context-menu-node.png" alt="Right-click on a node: edit properties, duplicate, delete"></td>
+</tr>
+<tr>
+<td><em>On empty canvas — a new node is placed where you clicked.</em></td>
+<td><em>On a node — the delete confirms first, listing what cascades with it.</em></td>
+</tr>
+</table>
 
 ## Authenticating against the Admin API
 
