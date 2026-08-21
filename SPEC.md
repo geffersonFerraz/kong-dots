@@ -71,7 +71,7 @@ Arrastar um Plugin sobre um Service/Route/Consumer no canvas = anexar o plugin �
 ┌─────────────────────┐        ┌──────────────────────────┐        ┌─────────────┐
 │   Frontend (Vue 3)   │  REST  │      Backend (Go)         │  HTTP  │  Kong #1    │
 │  Vue Flow + Pinia     │◄──────►│  API + Kong Admin client  │◄──────►│  Admin API  │
-│  canvas de nós         │  WS   │  Storage (Postgres/SQLite)│        └─────────────┘
+│  canvas de nós         │  WS   │  Storage (PostgreSQL 18)  │        └─────────────┘
 └─────────────────────┘        │                            │        ┌─────────────┐
                                  │                            │◄──────►│  Kong #2    │
                                  └──────────────────────────┘        └─────────────┘
@@ -81,7 +81,7 @@ Arrastar um Plugin sobre um Service/Route/Consumer no canvas = anexar o plugin �
 
 - **API**: REST (`net/http` + `chi` ou `echo`) para CRUD de "conexões Kong" e proxy/tradução das operações do canvas para chamadas de Admin API.
 - **Kong Admin Client**: client Go dedicado (pode usar o SDK oficial `github.com/Kong/sdk-konnect-go` ou um client HTTP fino próprio, já que a Admin API é REST simples).
-- **Storage**: Postgres (ou SQLite para instalação single-binary) guardando:
+- **Storage**: PostgreSQL 18 guardando:
   - conexões Kong cadastradas (URL, auth — segredo criptografado em repouso),
   - posições dos nós no canvas (layout é local à ferramenta, não existe no Kong),
   - histórico de aplicações.

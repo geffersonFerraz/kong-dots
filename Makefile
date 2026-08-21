@@ -1,7 +1,9 @@
-.PHONY: api ui serve build test test-backend test-frontend demo demo-kong demo-down demo-logs demo-check docker
+.PHONY: api ui serve build test test-backend test-frontend test-db test-db-down demo demo-kong demo-down demo-logs demo-check docker
 
 # --- development ---------------------------------------------------------
-# Backend only, on :8080. Pair with `make ui`, which proxies /api to it.
+# Backend only, on :8080. Needs a PostgreSQL — `make demo-kong` starts one on
+# :5432; point elsewhere with KONGDOTS_DATABASE_URL. Pair with `make ui`, which
+# proxies /api to it.
 api:
 	cd backend && go run ./cmd/server
 
@@ -19,8 +21,24 @@ build:
 
 test: test-backend test-frontend
 
-test-backend:
+test-backend: test-db
 	cd backend && go test ./...
+
+# Throwaway PostgreSQL 18 for the backend tests, on :5433 so it never touches
+# the database `make api` uses. Each test runs in a schema of its own.
+test-db:
+	@docker inspect -f '{{.State.Running}}' kongdots-test-db 2>/dev/null | grep -q true || { \
+	  docker rm -f kongdots-test-db >/dev/null 2>&1; \
+	  docker run -d --name kongdots-test-db \
+	    -e POSTGRES_USER=kongdots -e POSTGRES_PASSWORD=kongdots -e POSTGRES_DB=kongdots_test \
+	    -p 127.0.0.1:5433:5432 postgres:18-alpine >/dev/null; }
+	@for i in $$(seq 30); do \
+	  docker exec kongdots-test-db pg_isready -U kongdots -d kongdots_test >/dev/null 2>&1 && exit 0; \
+	  sleep 1; \
+	done; echo "kongdots-test-db never became ready" >&2; exit 1
+
+test-db-down:
+	docker rm -f kongdots-test-db >/dev/null 2>&1 || true
 
 test-frontend:
 	cd frontend && npm test
@@ -31,7 +49,8 @@ test-frontend:
 demo:
 	docker compose -f deploy/demo.yml --profile app up -d --build
 
-# Only Kong + the demo data, for use with `make api` / `make ui`.
+# Kong + the demo data + the Kong Dots database, for use with `make api` /
+# `make ui` on the host.
 demo-kong:
 	docker compose -f deploy/demo.yml up -d
 

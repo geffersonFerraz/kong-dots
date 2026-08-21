@@ -5,13 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/gefferson/kong-dots/backend/internal/cryptox"
-	"github.com/gefferson/kong-dots/backend/internal/store"
+	"github.com/gefferson/kong-dots/backend/internal/storetest"
 )
 
 // fakeKong is a stand-in Admin API: it keeps whatever is POSTed so tests can
@@ -69,11 +68,7 @@ func writeJSONTest(w http.ResponseWriter, v any) {
 
 func newTestServer(t *testing.T) http.Handler {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
+	st := storetest.New(t)
 	cipher, err := cryptox.New("unit-test-key")
 	if err != nil {
 		t.Fatal(err)

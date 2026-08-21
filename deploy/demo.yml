@@ -1,8 +1,10 @@
-# Self-contained demo stack: Kong 3.9.1 + Postgres, seeded with a topology whose
-# routes answer with canned JSON (request-termination), plus Kong Dots itself.
+# Self-contained demo stack: Kong 3.9.1 + its Postgres, Kong Dots + its own
+# Postgres 18, and a seeded topology whose routes answer with canned JSON
+# (request-termination).
 #
 #   make demo         Kong + demo data + the Kong Dots UI on :8080
-#   make demo-kong    only Kong + demo data (for `make api` / `make ui`)
+#   make demo-kong    Kong + demo data + the Kong Dots database, for `make api`
+#                     / `make ui` running on the host
 #   make demo-down    tear everything down, including volumes
 #
 # Every published port is bound to loopback.
@@ -65,6 +67,25 @@ services:
     entrypoint: ["sh", "/seed-demo.sh"]
     restart: on-failure
 
+  # Kong Dots' own store (connections, canvas layout, apply history). Separate
+  # from kong-db, which is Kong's. Started in both modes and published on
+  # loopback, so `make api` on the host uses the same database as `make demo`.
+  kong-dots-db:
+    image: postgres:18-alpine
+    ports:
+      - "127.0.0.1:${KONGDOTS_DB_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: kongdots
+      POSTGRES_PASSWORD: kongdots
+      POSTGRES_DB: kongdots
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kongdots -d kongdots"]
+      interval: 3s
+      retries: 20
+    volumes:
+      # Postgres 18 declares /var/lib/postgresql as its volume, not .../data.
+      - kong-dots-db:/var/lib/postgresql
+
   kong-dots:
     build:
       context: ..
@@ -74,10 +95,13 @@ services:
     depends_on:
       kong:
         condition: service_healthy
+      kong-dots-db:
+        condition: service_healthy
     environment:
       # Demo-only key. In a real deployment set KONGDOTS_SECRET_KEY from your
       # secret manager — losing it makes stored Admin API credentials unreadable.
       KONGDOTS_SECRET_KEY: demo-only-not-a-real-secret
+      KONGDOTS_DATABASE_URL: postgres://kongdots:kongdots@kong-dots-db:5432/kongdots?sslmode=disable
     ports:
       - "127.0.0.1:${KONGDOTS_PORT:-8080}:8080"
     volumes:
@@ -85,3 +109,4 @@ services:
 
 volumes:
   kong-dots-data:
+  kong-dots-db:

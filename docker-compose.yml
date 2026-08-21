@@ -1,8 +1,28 @@
 services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${KONGDOTS_DB_USER:-kongdots}
+      POSTGRES_PASSWORD: ${KONGDOTS_DB_PASSWORD:-kongdots}
+      POSTGRES_DB: ${KONGDOTS_DB_NAME:-kongdots}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KONGDOTS_DB_USER:-kongdots} -d ${KONGDOTS_DB_NAME:-kongdots}"]
+      interval: 5s
+      retries: 20
+    volumes:
+      # Postgres 18 keeps PGDATA under /var/lib/postgresql/18/docker and
+      # declares /var/lib/postgresql as its volume — mounting .../data instead
+      # would silently lose the database on every restart.
+      - kong-dots-db:/var/lib/postgresql
+
   kong-dots:
     build: .
     image: kong-dots:latest
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
       # Bound to loopback on purpose: expose it through the same Cloudflare
       # Tunnel / Zero Trust used by the rest of the infra, never directly.
@@ -12,8 +32,10 @@ services:
       # key is generated into the data volume on first start.
       KONGDOTS_SECRET_KEY: ${KONGDOTS_SECRET_KEY:-}
       KONGDOTS_CORS_ORIGINS: ${KONGDOTS_CORS_ORIGINS:-}
+      KONGDOTS_DATABASE_URL: postgres://${KONGDOTS_DB_USER:-kongdots}:${KONGDOTS_DB_PASSWORD:-kongdots}@db:5432/${KONGDOTS_DB_NAME:-kongdots}?sslmode=disable
     volumes:
       - kong-dots-data:/data
 
 volumes:
   kong-dots-data:
+  kong-dots-db:

@@ -25,9 +25,6 @@ func main() {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		log.Fatalf("data dir: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o700); err != nil {
-		log.Fatalf("db dir: %v", err)
-	}
 
 	key, err := cryptox.LoadOrCreateKey(cfg.SecretKey, cfg.DataDir)
 	if err != nil {
@@ -41,7 +38,7 @@ func main() {
 		log.Printf("KONGDOTS_SECRET_KEY not set; using generated key at %s", filepath.Join(cfg.DataDir, "secret.key"))
 	}
 
-	st, err := store.Open(cfg.DBPath)
+	st, err := store.Open(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
@@ -61,7 +58,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("kong-dots backend listening on %s (db: %s)", cfg.Addr, cfg.DBPath)
+		log.Printf("kong-dots backend listening on %s (db: %s)", cfg.Addr, store.Redact(cfg.DatabaseURL))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}

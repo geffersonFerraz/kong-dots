@@ -90,7 +90,7 @@ Re-running `make demo` is safe — the seed upserts by name and pins plugin ids.
 ## Quick start — development
 
 ```bash
-make demo-kong   # only Kong + the demo data, on :8000 / :8001
+make demo-kong   # Kong + the demo data on :8000 / :8001, and Postgres on :5432
 make api         # backend on :8080
 make ui          # Vite dev server with hot reload
 ```
@@ -99,7 +99,11 @@ Open **http://localhost:5173**. Or skip Vite and serve everything from the Go bi
 **http://localhost:8080** with `make serve`.
 
 Register a Kong by clicking **+** in the sidebar (`http://localhost:8001`, auth *None*).
-Run the tests with `make test` (`make test-backend` / `make test-frontend` individually).
+
+Run the tests with `make test` (`make test-backend` / `make test-frontend` individually). The
+backend tests run against a real PostgreSQL — `make test-backend` starts a throwaway one on `:5433`
+and gives each test its own schema; `make test-db-down` removes it. Point somewhere else with
+`KONGDOTS_TEST_DATABASE_URL`. Without a reachable database those tests skip instead of failing.
 
 ## Deployment
 
@@ -107,21 +111,27 @@ Run the tests with `make test` (`make test-backend` / `make test-frontend` indiv
 docker compose up -d --build
 ```
 
-One container: the Go binary serves the built SPA and the API on `:8080`, with SQLite in the
-`kong-dots-data` volume. The port is published on loopback only — put it behind the same
-Cloudflare Tunnel / Zero Trust as the rest of your services rather than exposing it directly.
+Two containers: the Go binary serves the built SPA and the API on `:8080`, and **PostgreSQL 18**
+holds the tool's own state (registered Kongs, canvas layout, apply history) in the `kong-dots-db`
+volume. Only `:8080` is published, on loopback — put it behind the same Cloudflare Tunnel / Zero
+Trust as the rest of your services rather than exposing it directly.
+
+To use a PostgreSQL you already run, set `KONGDOTS_DATABASE_URL` and drop the `db` service. The
+schema is created and migrated on start; the account needs `CREATE` on its schema.
 
 ### Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `KONGDOTS_ADDR` | `:8080` | Listen address |
-| `KONGDOTS_DATA_DIR` | `./data` | SQLite DB + generated encryption key |
-| `KONGDOTS_DB_PATH` | `$DATA_DIR/kong-dots.db` | SQLite file |
+| `KONGDOTS_DATABASE_URL` | `postgres://kongdots:kongdots@localhost:5432/kongdots?sslmode=disable` | PostgreSQL 18 connection string |
+| `KONGDOTS_DATA_DIR` | `./data` | Generated encryption key |
 | `KONGDOTS_SECRET_KEY` | *(generated)* | AES-GCM key for stored Admin API credentials |
 | `KONGDOTS_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins |
 | `KONGDOTS_STATIC_DIR` | *(unset)* | Serve a built SPA from this directory |
-| `KONGDOTS_PORT` / `KONG_PROXY_PORT` / `KONG_ADMIN_PORT` | `8080` / `8000` / `8001` | Host ports for the demo stack |
+| `KONGDOTS_DB_USER` / `KONGDOTS_DB_PASSWORD` / `KONGDOTS_DB_NAME` | `kongdots` | Credentials for the `db` service in `docker-compose.yml` |
+| `KONGDOTS_TEST_DATABASE_URL` | `postgres://kongdots:kongdots@localhost:5433/kongdots_test?sslmode=disable` | Database the backend tests use |
+| `KONGDOTS_PORT` / `KONG_PROXY_PORT` / `KONG_ADMIN_PORT` / `KONGDOTS_DB_PORT` | `8080` / `8000` / `8001` / `5432` | Host ports for the demo stack |
 
 Copy `.env.example` to `.env` and fill it in — Compose reads it automatically.
 
@@ -136,7 +146,7 @@ frontend/ (Vue 3 + Vue Flow + Pinia + Tailwind)      backend/ (Go + gin)
   stores/graph.js    canvas state, local diff,         internal/kong    Admin API client + snapshot
                      draft ids, dagre layout, filter   internal/plan    diff engine + ordered apply
   components/        canvas, property panel,           internal/deck    kong.yaml import/export
-                     diff viewer, history, filter      internal/store   SQLite: connections, layout, history
+                     diff viewer, history, filter      internal/store   Postgres: connections, layout, history
                                                        internal/api     gin router + WebSocket
 ```
 
