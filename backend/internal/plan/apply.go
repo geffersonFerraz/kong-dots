@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/gefferson/kong-dots/backend/internal/kong"
+	"github.com/gefferson/kong-flow/backend/internal/kong"
 )
 
 type OpStatus string

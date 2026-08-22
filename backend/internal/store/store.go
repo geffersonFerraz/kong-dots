@@ -58,11 +58,33 @@ CREATE TABLE IF NOT EXISTS apply_history (
   actor         TEXT NOT NULL DEFAULT 'local'
 );
 CREATE INDEX IF NOT EXISTS idx_history_conn ON apply_history(connection_id, applied_at DESC);
+
+-- A change somebody wants made to a Kong but is not allowed to make. It holds
+-- the desired canvas state and the state that canvas was built on, so an
+-- approver can re-plan it against a gateway that has moved on since.
+CREATE TABLE IF NOT EXISTS change_requests (
+  id            TEXT PRIMARY KEY,
+  connection_id TEXT NOT NULL,
+  title         TEXT NOT NULL DEFAULT '',
+  status        TEXT NOT NULL DEFAULT 'pending',
+  desired_json  TEXT NOT NULL,
+  baseline_json TEXT NOT NULL DEFAULT '',
+  plan_json     TEXT NOT NULL DEFAULT '',
+  result_json   TEXT NOT NULL DEFAULT '',
+  requested_by  TEXT NOT NULL DEFAULT '',
+  requested_at  TIMESTAMPTZ NOT NULL,
+  reviewed_by   TEXT NOT NULL DEFAULT '',
+  reviewed_at   TIMESTAMPTZ,
+  review_note   TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_requests_conn ON change_requests(connection_id, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_requests_pending ON change_requests(connection_id) WHERE status = 'pending';
 `
 
 // Open connects to PostgreSQL and brings the schema up to date. dsn is a
 // libpq/pgx connection string, e.g.
-// postgres://kongdots:secret@db:5432/kongdots?sslmode=disable.
+// postgres://kongflow:secret@db:5432/kongflow?sslmode=disable.
 //
 // The database is often started alongside this process (compose, k8s), so the
 // first connection is retried for a while instead of failing the boot.
@@ -331,16 +353,27 @@ type HistoryEntry struct {
 	Actor        string `json:"actor"`
 }
 
-func (s *Store) AddHistory(ctx context.Context, h HistoryEntry) error {
-	appliedAt := time.Now().UTC()
-	if h.AppliedAt != "" {
-		t, err := time.Parse(time.RFC3339, h.AppliedAt)
-		if err != nil {
-			return fmt.Errorf("applied_at %q: %w", h.AppliedAt, err)
-		}
-		appliedAt = t
+// parseTime reads an RFC3339 timestamp coming from the API, defaulting to now —
+// at full precision — when the caller did not send one. Callers that care about
+// ordering should leave it empty rather than formatting a second-resolution
+// string themselves.
+func parseTime(v string) (time.Time, error) {
+	if v == "" {
+		return time.Now().UTC(), nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("timestamp %q: %w", v, err)
+	}
+	return t, nil
+}
+
+func (s *Store) AddHistory(ctx context.Context, h HistoryEntry) error {
+	appliedAt, err := parseTime(h.AppliedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
 	  INSERT INTO apply_history (id,connection_id,applied_at,plan_json,result_json,status,error_message,actor)
 	  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		h.ID, h.ConnectionID, appliedAt, h.PlanJSON, h.ResultJSON, h.Status, h.ErrorMessage, h.Actor)
@@ -370,4 +403,195 @@ func (s *Store) ListHistory(ctx context.Context, connID string, limit int) ([]Hi
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// ------------------------------------------------------------------- locking
+
+// applyLockKey namespaces the advisory lock so it cannot collide with any other
+// use of PostgreSQL's single advisory-lock space.
+func applyLockKey(connID string) string { return "kong-flow:apply:" + connID }
+
+// LockConnection takes an advisory lock covering applies to one Kong, so two
+// people hitting "Apply" at the same moment cannot interleave their operations
+// — the lock lives in PostgreSQL, so it holds across replicas of this server
+// too. It never waits: an apply can run for minutes, and the second caller is
+// better told to retry than left hanging on a connection.
+//
+// The returned release must be called when the apply finishes; acquired is
+// false (with a nil error) when somebody else holds the lock.
+func (s *Store) LockConnection(ctx context.Context, connID string) (release func(), acquired bool, err error) {
+	// The lock belongs to the session that took it, so it has to be held on one
+	// pinned connection rather than borrowed from the pool per statement.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	key := applyLockKey(connID)
+	var ok bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1, 0))`, key).Scan(&ok); err != nil {
+		conn.Close()
+		return nil, false, err
+	}
+	if !ok {
+		conn.Close()
+		return nil, false, nil
+	}
+	return func() {
+		// The request's context is usually done by now (or was cancelled, which
+		// is exactly when releasing matters most), so unlock outside of it.
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, key)
+		conn.Close()
+	}, true, nil
+}
+
+// ----------------------------------------------------------- change requests
+
+// Change request statuses. A request leaves "pending" exactly once.
+const (
+	RequestPending   = "pending"
+	RequestApplied   = "applied"
+	RequestRejected  = "rejected"
+	RequestFailed    = "failed"
+	RequestWithdrawn = "withdrawn"
+)
+
+// ChangeRequest is a proposed change waiting for somebody allowed to push it to
+// Kong. The heavy JSON blobs stay out of the wire format; the API layer decides
+// which of them a given endpoint returns.
+type ChangeRequest struct {
+	ID           string `json:"id"`
+	ConnectionID string `json:"connection_id"`
+	Title        string `json:"title"`
+	Status       string `json:"status"`
+	DesiredJSON  string `json:"-"`
+	BaselineJSON string `json:"-"`
+	// PlanJSON is the plan as it looked when the request was made — a record of
+	// intent, not what will run. Approving re-plans against the live gateway.
+	PlanJSON     string `json:"-"`
+	ResultJSON   string `json:"-"`
+	RequestedBy  string `json:"requested_by"`
+	RequestedAt  string `json:"requested_at"`
+	ReviewedBy   string `json:"reviewed_by,omitempty"`
+	ReviewedAt   string `json:"reviewed_at,omitempty"`
+	ReviewNote   string `json:"review_note,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	// Summary counts the operations the request asked for, so a list can be
+	// rendered without shipping every plan.
+	Summary map[string]int `json:"summary,omitempty"`
+}
+
+const requestCols = `id,connection_id,title,status,desired_json,baseline_json,plan_json,result_json,
+	requested_by,requested_at,reviewed_by,reviewed_at,review_note,error_message`
+
+func (s *Store) CreateChangeRequest(ctx context.Context, r ChangeRequest) error {
+	requestedAt, err := parseTime(r.RequestedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+	  INSERT INTO change_requests (`+requestCols+`)
+	  VALUES ($1,$2,$3,$4,$5,$6,$7,'',$8,$9,'',NULL,'','')`,
+		r.ID, r.ConnectionID, r.Title, defaultTo(r.Status, RequestPending),
+		r.DesiredJSON, r.BaselineJSON, r.PlanJSON, r.RequestedBy, requestedAt)
+	return err
+}
+
+// ListChangeRequests returns a connection's requests, newest first. status may
+// be empty for all of them.
+func (s *Store) ListChangeRequests(ctx context.Context, connID, status string, limit int) ([]ChangeRequest, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+	  SELECT `+requestCols+` FROM change_requests
+	  WHERE connection_id=$1 AND ($2 = '' OR status=$2)
+	  ORDER BY requested_at DESC LIMIT $3`, connID, status, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ChangeRequest{}
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetChangeRequest(ctx context.Context, id string) (ChangeRequest, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+requestCols+` FROM change_requests WHERE id=$1`, id)
+	r, err := scanRequest(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ChangeRequest{}, ErrNotFound
+	}
+	return r, err
+}
+
+// CountPendingRequests powers the "N waiting for review" badge.
+func (s *Store) CountPendingRequests(ctx context.Context, connID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM change_requests WHERE connection_id=$1 AND status=$2`, connID, RequestPending).Scan(&n)
+	return n, err
+}
+
+// Review moves a request out of "pending". The status guard is the whole point:
+// two approvers clicking at the same moment means the second one is told the
+// request was already decided instead of applying it twice.
+func (s *Store) Review(ctx context.Context, id, status, reviewedBy, note, resultJSON, errMessage string) error {
+	res, err := s.db.ExecContext(ctx, `
+	  UPDATE change_requests
+	  SET status=$2, reviewed_by=$3, reviewed_at=$4, review_note=$5, result_json=$6, error_message=$7
+	  WHERE id=$1 AND status=$8`,
+		id, status, reviewedBy, time.Now().UTC(), note, resultJSON, errMessage, RequestPending)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func scanRequest(sc scanner) (ChangeRequest, error) {
+	var r ChangeRequest
+	var requestedAt time.Time
+	var reviewedAt sql.NullTime
+	err := sc.Scan(&r.ID, &r.ConnectionID, &r.Title, &r.Status, &r.DesiredJSON, &r.BaselineJSON,
+		&r.PlanJSON, &r.ResultJSON, &r.RequestedBy, &requestedAt, &r.ReviewedBy, &reviewedAt,
+		&r.ReviewNote, &r.ErrorMessage)
+	r.RequestedAt = rfc3339(requestedAt)
+	if reviewedAt.Valid {
+		r.ReviewedAt = rfc3339(reviewedAt.Time)
+	}
+	return r, err
+}
+
+func defaultTo(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// GetHistoryEntry loads one recorded run, which is what a rollback is built
+// from: the plan that was applied plus which of its operations Kong accepted.
+func (s *Store) GetHistoryEntry(ctx context.Context, id string) (HistoryEntry, error) {
+	row := s.db.QueryRowContext(ctx, `
+	  SELECT id,connection_id,applied_at,plan_json,result_json,status,error_message,actor
+	  FROM apply_history WHERE id=$1`, id)
+	var h HistoryEntry
+	var appliedAt time.Time
+	err := row.Scan(&h.ID, &h.ConnectionID, &appliedAt, &h.PlanJSON, &h.ResultJSON,
+		&h.Status, &h.ErrorMessage, &h.Actor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return HistoryEntry{}, ErrNotFound
+	}
+	h.AppliedAt = rfc3339(appliedAt)
+	return h, err
 }

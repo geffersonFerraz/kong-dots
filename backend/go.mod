@@ -1,4 +1,4 @@
-module github.com/gefferson/kong-dots/backend
+module github.com/gefferson/kong-flow/backend
 
 go 1.25.0
 

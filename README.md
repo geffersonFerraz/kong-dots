@@ -1,4 +1,4 @@
-# Kong Dots
+# Kong Flow
 
 A Node-RED–style visual manager for **multiple Kong API Gateways**. Each registered Kong is a
 workspace; inside it the topology (Services, Routes, Plugins, Consumers, Upstreams, Targets) is a
@@ -19,13 +19,18 @@ Implements the MVP in [SPEC.md](SPEC.md).
 | Dynamic plugin property form from `/schemas/plugins/{name}` | ✅ |
 | Create / edit / delete nodes, drag-to-connect, cascade-aware delete | ✅ |
 | Validation of what Kong requires, before an apply is attempted | ✅ |
-| Copy/paste entities between Kongs through the system clipboard | ✅ |
+| Copy/paste a whole node — Service + Routes + Plugins + its Upstream and Targets | ✅ |
+| Several people on the same Kong at once: **one shared draft**, live pointers, shared dragging, presence, stale-delete protection, conflict detection | ✅ |
+| Undo / redo on the canvas (<kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>) | ✅ |
+| Roll back an applied run against Kong, conflict-checked and itself recorded | ✅ |
+| Change requests: everyone plans and proposes, only approvers push to Kong | ✅ |
 | Draft state + `terraform plan`-style diff before touching Kong | ✅ |
 | Apply in dependency order, live progress over WebSocket, apply history | ✅ |
 | Export **and** import decK `kong.yaml` | ✅ |
 | Canvas layout persisted per Kong (dagre auto-layout for anything new) | ✅ |
-| Automatic rollback on partial failure | ❌ — apply stops at the first error and logs it (per spec §10.5) |
-| Konnect, RBAC/multi-user, K8s ingress | ❌ — post-MVP |
+| Automatic rollback on partial failure | ❌ — apply stops at the first error and logs it (per spec §10.5); undoing it afterwards is a button |
+| Real authentication (OIDC / SSO) behind the approver role | ❌ — the actor is a self-declared name plus a shared approval token |
+| Konnect, K8s ingress | ❌ — post-MVP |
 
 Editing is always two-phase: the canvas is a **draft**, and nothing reaches the Admin API until
 *Review changes → Apply*. The plan is recomputed against the live state at apply time, so a stale
@@ -44,16 +49,20 @@ Two rules protect the draft:
 
 ## Quick start — demo stack
 
-One command brings up Kong 3.9.1, a seeded topology and Kong Dots itself:
+One command brings up Kong 3.9.1, a seeded topology and Kong Flow itself:
 
 ```bash
-cp .env.example .env      # optional: set KONGDOTS_SECRET_KEY
+cp .env.example .env      # optional: set KONGFLOW_SECRET_KEY
 make demo
 ```
 
+To try the shared canvas with somebody else, set `KONGFLOW_BIND=0.0.0.0` in `.env` before `make demo`
+and open the machine's LAN address instead of `localhost`. It stays off by default, and it never
+exposes Kong's Admin API — see [Configuration](#configuration).
+
 | | URL |
 |---|---|
-| **Kong Dots UI** | **http://localhost:8080** |
+| **Kong Flow UI** | **http://localhost:8080** |
 | Kong proxy | http://localhost:8000 |
 | Kong Admin API | http://localhost:8001 |
 
@@ -103,7 +112,7 @@ Register a Kong by clicking **+** in the sidebar (`http://localhost:8001`, auth 
 Run the tests with `make test` (`make test-backend` / `make test-frontend` individually). The
 backend tests run against a real PostgreSQL — `make test-backend` starts a throwaway one on `:5433`
 and gives each test its own schema; `make test-db-down` removes it. Point somewhere else with
-`KONGDOTS_TEST_DATABASE_URL`. Without a reachable database those tests skip instead of failing.
+`KONGFLOW_TEST_DATABASE_URL`. Without a reachable database those tests skip instead of failing.
 
 ## Deployment
 
@@ -112,43 +121,53 @@ docker compose up -d --build
 ```
 
 Two containers: the Go binary serves the built SPA and the API on `:8080`, and **PostgreSQL 18**
-holds the tool's own state (registered Kongs, canvas layout, apply history) in the `kong-dots-db`
+holds the tool's own state (registered Kongs, canvas layout, apply history) in the `kong-flow-db`
 volume. Only `:8080` is published, on loopback — put it behind the same Cloudflare Tunnel / Zero
 Trust as the rest of your services rather than exposing it directly.
 
-To use a PostgreSQL you already run, set `KONGDOTS_DATABASE_URL` and drop the `db` service. The
+To use a PostgreSQL you already run, set `KONGFLOW_DATABASE_URL` and drop the `db` service. The
 schema is created and migrated on start; the account needs `CREATE` on its schema.
 
 ### Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `KONGDOTS_ADDR` | `:8080` | Listen address |
-| `KONGDOTS_DATABASE_URL` | `postgres://kongdots:kongdots@localhost:5432/kongdots?sslmode=disable` | PostgreSQL 18 connection string |
-| `KONGDOTS_DATA_DIR` | `./data` | Generated encryption key |
-| `KONGDOTS_SECRET_KEY` | *(generated)* | AES-GCM key for stored Admin API credentials |
-| `KONGDOTS_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins |
-| `KONGDOTS_STATIC_DIR` | *(unset)* | Serve a built SPA from this directory |
-| `KONGDOTS_DB_USER` / `KONGDOTS_DB_PASSWORD` / `KONGDOTS_DB_NAME` | `kongdots` | Credentials for the `db` service in `docker-compose.yml` |
-| `KONGDOTS_TEST_DATABASE_URL` | `postgres://kongdots:kongdots@localhost:5433/kongdots_test?sslmode=disable` | Database the backend tests use |
-| `KONGDOTS_PORT` / `KONG_PROXY_PORT` / `KONG_ADMIN_PORT` / `KONGDOTS_DB_PORT` | `8080` / `8000` / `8001` / `5432` | Host ports for the demo stack |
+| `KONGFLOW_ADDR` | `:8080` | Listen address |
+| `KONGFLOW_DATABASE_URL` | `postgres://kongflow:kongflow@localhost:5432/kongflow?sslmode=disable` | PostgreSQL 18 connection string |
+| `KONGFLOW_DATA_DIR` | `./data` | Generated encryption key |
+| `KONGFLOW_SECRET_KEY` | *(generated)* | AES-GCM key for stored Admin API credentials |
+| `KONGFLOW_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins |
+| `KONGFLOW_BIND` | `127.0.0.1` | Address the published ports bind to. `0.0.0.0` reaches the UI and the Kong proxy from the network; it never opens Kong's Admin API or PostgreSQL |
+| `KONGFLOW_APPROVERS` | *(unset)* | Comma-separated names allowed to apply to Kong. Unset ⇒ everyone applies directly |
+| `KONGFLOW_APPROVER_TOKEN` | *(unset)* | Shared secret required to approve. Set it together with `KONGFLOW_APPROVERS` |
+| `KONGFLOW_STATIC_DIR` | *(unset)* | Serve a built SPA from this directory |
+| `KONGFLOW_DB_USER` / `KONGFLOW_DB_PASSWORD` / `KONGFLOW_DB_NAME` | `kongflow` | Credentials for the `db` service in `docker-compose.yml` |
+| `KONGFLOW_TEST_DATABASE_URL` | `postgres://kongflow:kongflow@localhost:5433/kongflow_test?sslmode=disable` | Database the backend tests use |
+| `KONGFLOW_PORT` / `KONG_PROXY_PORT` / `KONG_ADMIN_PORT` / `KONGFLOW_DB_PORT` | `8080` / `8000` / `8001` / `5432` | Host ports for the demo stack |
 
 Copy `.env.example` to `.env` and fill it in — Compose reads it automatically.
 
-Set `KONGDOTS_SECRET_KEY` from your secret manager in production. Without it, a random key is
-generated into `$KONGDOTS_DATA_DIR/secret.key` on first start — losing that file means the stored
+Set `KONGFLOW_SECRET_KEY` from your secret manager in production. Without it, a random key is
+generated into `$KONGFLOW_DATA_DIR/secret.key` on first start — losing that file means the stored
 Admin API credentials can no longer be decrypted.
 
 ## Architecture
 
 ```
-frontend/ (Vue 3 + Vue Flow + Pinia + Tailwind)      backend/ (Go + gin)
-  stores/graph.js    canvas state, local diff,         internal/kong    Admin API client + snapshot
-                     draft ids, dagre layout, filter   internal/plan    diff engine + ordered apply
-  components/        canvas, property panel,           internal/deck    kong.yaml import/export
-                     diff viewer, history, filter      internal/store   Postgres: connections, layout, history
-                                                       internal/api     gin router + WebSocket
+frontend/ (Vue 3 + Vue Flow + Pinia + Tailwind)   backend/ (Go + gin)
+  stores/graph.js     shared draft, edit funnel,     internal/kong     Admin API client + snapshot
+                      undo/redo, local diff,         internal/plan     diff engine, ordered apply,
+                      draft ids, dagre layout                          rollback of a recorded run
+  stores/session.js   identity, approver role,       internal/deck     kong.yaml import/export
+                      presence, pointers             internal/store    Postgres: connections, layout,
+  stores/requests.js  the approval queue                               history, change requests
+  components/         canvas, property panel,        internal/api      gin router, WebSocket hub,
+                      diff, history, queue                             approval queue, rollback
 ```
+
+The browsers hold the shared draft; PostgreSQL holds what the tool owns (registered Kongs, canvas
+layout, apply history, queued change requests). Kong itself is never duplicated — it is read live
+and remains the only source of truth for what is deployed.
 
 ### Finding things on a big canvas
 
@@ -229,15 +248,26 @@ different one.
 ### Moving work between Kongs
 
 **Copy** on a node (or <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>C</kbd>) puts it on the **system
-clipboard** as JSON, together with everything that belongs to it: a Service travels with its Routes
-and every plugin on them. <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>V</kbd> on any canvas pastes it back as
-drafts, wired the same way — including in another workspace, another browser window, or a colleague's
-message, since it is ordinary text.
+clipboard** as JSON, together with everything that belongs to it. A Service travels with:
+
+* every **Route** on it, and every **Plugin** on the Service or on those Routes;
+* the **Upstream** its `host` names, and that Upstream's **Targets**.
+
+That last part is what makes a copy usable on the other side: a Service points at its balancer by
+name, so without the Upstream it lands in the target Kong addressing a host nothing answers on. It
+is deliberately wider than the delete cascade — deleting a Service must leave a shared Upstream
+alone, copying one must not.
+
+<kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>V</kbd> on any canvas pastes it back as drafts, wired the same way
+— including in another workspace, another browser window, or a colleague's message, since it is
+ordinary text.
 
 Ids from the source gateway are stripped, and references pointing outside the bundle are dropped:
 copying a Route alone leaves it serviceless in the target, because the Service it belonged to lives
-in a different Kong. Pasting twice is safe — each paste gets its own draft ids — and the usual
-review-then-apply still stands.
+in a different Kong. **Names that are already taken are moved aside** (`billing` → `billing-copy` →
+`billing-copy-2`), so pasting back into the Kong you copied from is not a 409 waiting to happen —
+and a renamed Upstream drags the pasted Service's `host` along with it. Pasting twice is safe, and
+the usual review-then-apply still stands.
 
 <table>
 <tr>
@@ -251,6 +281,117 @@ review-then-apply still stands.
 <td><em>On an edge — disconnecting clears the foreign key behind it, here <code>route.service</code>.</em></td>
 </tr>
 </table>
+
+## Working alongside other people
+
+Several people can have the same Kong open. Kong itself is the shared state — this tool keeps no
+copy of it — so what has to be handled is everything around that.
+
+**Nobody deletes what they never saw.** The canvas sends the backend both the state it wants *and*
+the baseline it was loaded from. A plan can then tell "the user removed this" apart from "somebody
+added this ten minutes after this tab opened": the second is reported as left untouched, never as a
+delete. Without the baseline — the old behaviour — an old tab pressing Apply wiped out everything
+created since it loaded.
+
+**Nobody silently overwrites an edit.** If an entity changed in Kong after the canvas read it, the
+plan comes back with a **conflict**: what it is, and field by field what the other person did. The
+apply is refused with a 409 until you either refresh (take their version) or say explicitly that
+yours wins.
+
+**One apply at a time per Kong**, enforced with a PostgreSQL advisory lock, so two runs cannot
+interleave their operations — across replicas of this server, too.
+
+![two people on the same Kong](docs/collaboration.png)
+
+*Two browsers on the same gateway: the toolbar counts the other editor, their pointer moves across
+the canvas with their name on it, and the Route they have open is ringed and initialled.*
+
+**You can see who else is here, and what they are doing.** The toolbar counts the other editors on
+this gateway, a node somebody else has open is ringed and initialled, and their **pointer moves on
+your canvas** with their name on it. **Dragging is shared**: a node travels on everyone's screen
+while it is being moved, not once it is dropped. When somebody's change lands, every other canvas
+gets a "this is out of date — refresh" strip instead of quietly going stale.
+
+**The draft itself is shared.** Adding a Route, editing a plugin's config, deleting a Service, pasting
+a bundle, dragging a node — each lands on everyone else's canvas as it happens. Nothing there has
+touched Kong: it is still one draft that several people are building together, and it still takes a
+Review → Apply to become real.
+
+Every edit goes through one funnel in the store, which works out the entities it changed and sends
+that list on. Removals travel as an explicit `null`. The server relays them without looking inside —
+it decides who sees an edit, not what an edit means.
+
+A tab that opens a Kong somebody is already working on **asks for the current draft** rather than
+starting from what Kong reports and overwriting their work on the first edit. The longest-serving tab
+answers, so a room of five hands over one copy, not five. **Refresh** and **Discard** are the way
+back: both are deliberate "everyone returns to what Kong says", and both reach the other canvases.
+
+Pointers and drags travel in **flow coordinates**, so they land on the same node for everybody
+regardless of how each person has panned and zoomed. They go out at 25 frames a second, are relayed
+straight to the other canvases rather than through the presence roster — which would otherwise
+rebuild and re-send the whole peer list on every mouse move — and are **not sent at all while you
+are alone on a Kong**, which is the common case. None of it is persisted: pointers die with the
+socket.
+
+Node positions are the one exception, because layout is shared per Kong (`canvas_layout`, not
+per user): the person who dragged writes the final position, everybody else just follows. A frame
+for a node you are dragging yourself is ignored, so two people cannot fight over one node mid-drag.
+
+### Undo, redo, and rolling back
+
+<kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Z</kbd> takes back the last thing **you** did;
+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> (or <kbd>Ctrl</kbd>+<kbd>Y</kbd>) puts it back. The
+toolbar has both, and each names what it would undo. Fifty steps are kept, and a cascading delete,
+a paste and a drag are each a single step — undoing a deleted Service brings its Routes and their
+plugins back wired as they were.
+
+Undo is **local by design**: it takes back your own work, never the edit somebody else just made.
+An undo is published like any other edit, so everyone's canvas follows it.
+
+> Where this is honest about its limits: two people editing the *same entity* at the same time is
+> last-write-wins, and an undo restores that entity wholesale — so undoing your edit to a Service
+> that somebody changed in between takes their change with it. Coming from a Kong of a few people
+> working on different services, that is a fair trade for a mechanism you can reason about.
+
+Rolling back is the other half, and it is about Kong rather than the canvas. Every run is in the
+**History** panel, and any of them can be reverted: what it created is deleted, what it updated goes
+back to the values it had, what it deleted is recreated **with the id it used to hold**. Only the
+operations Kong actually accepted are inverted, so a run that failed halfway undoes just the part
+that landed.
+
+The plan is **rebuilt against Kong when you press the button**, not stored from when the run
+happened — so a run from last week is judged on today's gateway. Anything already undone by hand is
+left out; anything changed since comes back as a conflict you have to accept explicitly. The
+rollback is applied under the same lock as any other apply and is **recorded in the history itself**,
+so it can be rolled back in turn.
+
+### Change requests: who may actually touch Kong
+
+By default there are no approvers configured and everyone applies directly — a single-operator
+install behaves exactly as it always did.
+
+Set **`KONGFLOW_APPROVERS`** (and/or **`KONGFLOW_APPROVER_TOKEN`**) and the queue turns on:
+
+| | Editor (default) | Approver |
+|---|---|---|
+| Read the topology, edit the canvas, build a plan | ✅ | ✅ |
+| Press *Apply* | ✅ — files a **change request**; nothing reaches Kong | ✅ — runs against Kong |
+| Approve / reject somebody's request | ❌ | ✅ |
+| Preview what rolling a run back would do | ✅ | ✅ |
+| Actually roll a run back | ❌ | ✅ |
+| Withdraw a request | own only | any |
+
+A request stores the proposed canvas **and** the baseline it was built on. When an approver opens
+it, the plan is **rebuilt against Kong as it is at that moment** — not as it was when the request
+was written — so a change that sat in the queue overnight is judged on today's gateway, conflicts
+and all. Approving runs it under the same lock and records it in the apply history, naming both the
+approver and the author.
+
+> **What this is and is not.** There is no login yet: the actor is a name the browser declares, and
+> `KONGFLOW_APPROVER_TOKEN` is the only part that actually authenticates. Configure both — the token
+> is required to approve, and the name list narrows who may use it. Treat the name alone as a
+> convention inside a trusted team; put real authentication (SSO, or an authenticating proxy setting
+> `X-KongFlow-Actor`) in front of this before it guards a production gateway.
 
 ## Authenticating against the Admin API
 
@@ -272,7 +413,7 @@ the form-urlencoded body, never as headers, so they cannot end up in a proxy acc
 POST /oauth2/token HTTP/1.1
 Content-Type: application/x-www-form-urlencoded
 
-grant_type=client_credentials&client_id=kong-dots&client_secret=%E2%80%A6
+grant_type=client_credentials&client_id=kong-flow&client_secret=%E2%80%A6
 ```
 
 The response is read as JSON:
@@ -313,3 +454,14 @@ and scope.
 * Enterprise workspaces are supported as a per-connection prefix; register a Kong once per
   workspace rather than switching inside one entry.
 * The decK export mirrors what Kong returns, including server-filled defaults.
+* Presence, pointers, drags and apply events are broadcast in-process. Running more than one replica
+  needs a shared relay (PostgreSQL `LISTEN`/`NOTIFY`) before the events reach browsers on the other
+  replica — the apply lock and the change-request queue already work across replicas, since both
+  live in the database.
+* Canvas layout is shared, not per user: two people cannot arrange the same Kong differently.
+* The shared draft lives in the browsers, not in the database: if every tab on a Kong closes, the
+  unapplied draft goes with them. Applying it, or exporting decK, is what makes it durable.
+* Concurrent edits to the *same entity* resolve last-write-wins, and undo restores an entity
+  wholesale rather than replaying just your own change out of it.
+* The approver role is only as strong as `KONGFLOW_APPROVER_TOKEN`; see *Working alongside other
+  people* for what that means.

@@ -18,31 +18,34 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"github.com/gefferson/kong-dots/backend/internal/cryptox"
-	"github.com/gefferson/kong-dots/backend/internal/deck"
-	"github.com/gefferson/kong-dots/backend/internal/kong"
-	"github.com/gefferson/kong-dots/backend/internal/oauth"
-	"github.com/gefferson/kong-dots/backend/internal/plan"
-	"github.com/gefferson/kong-dots/backend/internal/store"
+	"github.com/gefferson/kong-flow/backend/internal/cryptox"
+	"github.com/gefferson/kong-flow/backend/internal/deck"
+	"github.com/gefferson/kong-flow/backend/internal/kong"
+	"github.com/gefferson/kong-flow/backend/internal/oauth"
+	"github.com/gefferson/kong-flow/backend/internal/plan"
+	"github.com/gefferson/kong-flow/backend/internal/store"
 )
 
 type Server struct {
 	store  *store.Store
 	cipher *cryptox.Cipher
 	hub    *Hub
+	// approval decides who may push a change to a real Kong; everybody else's
+	// apply is filed as a change request instead.
+	approval Approval
 	// tokens caches one OAuth2 token per connection, so a token is minted once
 	// and reused until it expires instead of per HTTP request.
 	tokens *oauth.Registry
 }
 
-func NewServer(st *store.Store, c *cryptox.Cipher, hub *Hub) *Server {
-	return &Server{store: st, cipher: c, hub: hub, tokens: oauth.NewRegistry()}
+func NewServer(st *store.Store, c *cryptox.Cipher, hub *Hub, approval Approval) *Server {
+	return &Server{store: st, cipher: c, hub: hub, approval: approval, tokens: oauth.NewRegistry()}
 }
 
 // Router builds the gin engine. When staticDir is set, anything that is not an
 // API route falls back to the built SPA.
 func (s *Server) Router(corsOrigins []string, staticDir string) http.Handler {
-	if os.Getenv("KONGDOTS_DEBUG") == "" {
+	if os.Getenv("KONGFLOW_DEBUG") == "" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
@@ -56,6 +59,7 @@ func (s *Server) Router(corsOrigins []string, staticDir string) http.Handler {
 
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	r.GET("/api/ws", gin.WrapF(s.hub.Handle))
+	r.GET("/api/me", s.whoami)
 
 	conns := r.Group("/api/connections")
 	{
@@ -76,9 +80,17 @@ func (s *Server) Router(corsOrigins []string, staticDir string) http.Handler {
 			one.GET("/schemas/*path", s.schema)
 			one.POST("/plan", s.buildPlan)
 			one.POST("/apply", s.apply)
+			one.GET("/requests", s.listRequests)
+			one.POST("/requests", s.submitRequest)
+			one.GET("/requests/:reqId", s.getRequest)
+			one.POST("/requests/:reqId/approve", s.approveRequest)
+			one.POST("/requests/:reqId/reject", s.rejectRequest)
+			one.POST("/requests/:reqId/withdraw", s.withdrawRequest)
 			one.GET("/export", s.export)
 			one.POST("/import", s.importDeck)
 			one.GET("/history", s.history)
+			one.GET("/history/:historyId/rollback", s.previewRollback)
+			one.POST("/history/:historyId/rollback", s.rollback)
 		}
 	}
 
@@ -573,9 +585,7 @@ func (s *Server) buildPlan(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var req struct {
-		Desired kong.State `json:"desired"`
-	}
+	var req planReq
 	if err := decode(c, &req); err != nil {
 		fail(c, http.StatusBadRequest, err)
 		return
@@ -587,25 +597,77 @@ func (s *Server) buildPlan(c *gin.Context) {
 		fail(c, http.StatusBadGateway, err)
 		return
 	}
-	c.JSON(http.StatusOK, plan.Build(current, req.Desired))
+	c.JSON(http.StatusOK, plan.BuildWith(current, req.Desired, req.options()))
 }
+
+// planReq is what the canvas sends for both /plan and /apply.
+type planReq struct {
+	Desired kong.State `json:"desired"`
+	// Baseline is the live state this canvas was loaded from. Sending it is what
+	// lets two people work on the same Kong at once: without it, everything the
+	// canvas has not heard of looks like something the user deleted.
+	Baseline kong.State `json:"baseline"`
+	Plan     *plan.Plan `json:"plan"`
+	// Force applies even though entities drifted underneath the canvas.
+	Force bool `json:"force"`
+	// Title is the one-line description an editor gives a change request.
+	Title string `json:"title"`
+	// Actor and ClientID identify the editor, for the history and so the other
+	// canvases can tell whose change just landed.
+	Actor    string `json:"actor"`
+	ClientID string `json:"client_id"`
+}
+
+func (r planReq) options() plan.Options { return plan.Options{Baseline: r.Baseline} }
 
 func (s *Server) apply(c *gin.Context) {
 	client, conn, ok := s.resolve(c)
 	if !ok {
 		return
 	}
-	var req struct {
-		Desired kong.State `json:"desired"`
-		Plan    *plan.Plan `json:"plan"`
-	}
+	var req planReq
 	if err := decode(c, &req); err != nil {
 		fail(c, http.StatusBadRequest, err)
+		return
+	}
+	if req.Desired == nil && req.Plan == nil {
+		fail(c, http.StatusBadRequest, errors.New("either desired or plan is required"))
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
 	defer cancel()
+
+	// An editor who may not touch this Kong still gets to press Apply: what it
+	// does is file the change for review, and say so.
+	who := s.identity(c)
+	if !who.Approver {
+		cr, err := s.fileRequest(ctx, client, conn, req, who.Actor)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{
+			"status":  "pending_approval",
+			"request": cr,
+			"message": "Filed for approval — nothing has been sent to Kong yet.",
+		})
+		return
+	}
+
+	// One apply at a time per Kong. Everything below reads the live state and
+	// then writes to it, so a second apply starting in between would plan
+	// against a gateway that is already being changed.
+	release, locked, err := s.store.LockConnection(ctx, conn.ID)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, err)
+		return
+	}
+	if !locked {
+		fail(c, http.StatusConflict, errors.New("another apply is already running against this Kong — try again in a moment"))
+		return
+	}
+	defer release()
 
 	// Always re-plan against the live state so an apply cannot act on a stale
 	// diff produced minutes earlier.
@@ -617,11 +679,19 @@ func (s *Server) apply(c *gin.Context) {
 			fail(c, http.StatusBadGateway, err)
 			return
 		}
-		p = plan.Build(current, req.Desired)
-	case req.Plan != nil:
-		p = *req.Plan
+		p = plan.BuildWith(current, req.Desired, req.options())
 	default:
-		fail(c, http.StatusBadRequest, errors.New("either desired or plan is required"))
+		p = *req.Plan
+	}
+
+	// Somebody else changed these entities after this canvas read them. Applying
+	// would quietly undo their work, so the canvas is sent back the drift and
+	// has to decide: reload, or say force.
+	if p.HasConflicts() && !req.Force {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("%d entit%s changed in Kong since this canvas loaded", len(p.Conflicts), plural(len(p.Conflicts), "y", "ies")),
+			"plan":  p,
+		})
 		return
 	}
 
@@ -638,15 +708,23 @@ func (s *Server) apply(c *gin.Context) {
 		s.hub.Broadcast(conn.ID, "apply_progress", ev)
 	})
 
+	actor := defaultStr(who.Actor, defaultStr(strings.TrimSpace(req.Actor), "local"))
 	planJSON, _ := json.Marshal(p)
 	resultJSON, _ := json.Marshal(result)
 	_ = s.store.AddHistory(ctx, store.HistoryEntry{
 		ID: uuid.NewString(), ConnectionID: conn.ID,
-		AppliedAt: time.Now().UTC().Format(time.RFC3339),
-		PlanJSON:  string(planJSON), ResultJSON: string(resultJSON),
-		Status: result.Status, ErrorMessage: result.Error, Actor: "local",
+		// AppliedAt is left to the store, which timestamps at full precision.
+		// Formatting it here would round to the second, and two runs inside the
+		// same second — an apply and the rollback undoing it — would then sort
+		// arbitrarily against each other in the history.
+		PlanJSON: string(planJSON), ResultJSON: string(resultJSON),
+		Status: result.Status, ErrorMessage: result.Error, Actor: actor,
 	})
 	s.hub.Broadcast(conn.ID, "apply_finished", result)
+	// Every other canvas on this Kong is now looking at a stale topology.
+	s.hub.Broadcast(conn.ID, "state_changed", gin.H{
+		"by": req.ClientID, "actor": actor, "summary": p.Summary, "status": result.Status,
+	})
 	c.JSON(http.StatusOK, gin.H{"plan": p, "result": result})
 }
 
@@ -697,6 +775,14 @@ func (s *Server) history(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, entries)
+}
+
+// plural picks the right suffix for a count, for messages the user reads.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func defaultStr(v, def string) string {

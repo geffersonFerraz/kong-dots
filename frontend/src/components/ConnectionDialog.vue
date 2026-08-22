@@ -170,7 +170,7 @@ const labelClass = 'block text-[11px] font-medium uppercase tracking-wide text-s
         <div v-if="isOAuth" class="space-y-3 rounded-md border border-[#2a3140] bg-[#12161f] p-3">
           <p class="text-[11px] text-slate-500">
             A token is requested with <code class="text-slate-400">grant_type=client_credentials</code> and reused until
-            it expires; Kong Dots renews it before every action once it runs out.
+            it expires; Kong Flow renews it before every action once it runs out.
           </p>
           <label :class="labelClass">
             Token URL
@@ -266,7 +266,7 @@ const labelClass = 'block text-[11px] font-medium uppercase tracking-wide text-s
       </footer>
 
       <div v-if="confirmingDelete" class="border-t border-rose-500/30 bg-rose-500/5 px-5 py-3 text-sm text-rose-200">
-        Remove “{{ connection.name }}” from Kong Dots? The Kong instance itself is untouched.
+        Remove “{{ connection.name }}” from Kong Flow? The Kong instance itself is untouched.
         <div class="mt-2 flex gap-2">
           <button class="rounded-md bg-rose-600 px-3 py-1 text-white hover:bg-rose-500" @click="remove">Yes, remove</button>
           <button class="rounded-md border border-[#2c3444] px-3 py-1 text-slate-300" @click="confirmingDelete = false">

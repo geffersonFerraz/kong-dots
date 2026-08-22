@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/gefferson/kong-dots/backend/internal/kong"
+	"github.com/gefferson/kong-flow/backend/internal/kong"
 )
 
 func ent(j string) kong.Entity {
@@ -348,5 +349,261 @@ func TestApplyReportsProgressForEveryOperation(t *testing.T) {
 	want := "op_start,op_done,op_start,op_done,finished"
 	if strings.Join(events, ",") != want {
 		t.Fatalf("progress stream was %v, want %s", events, want)
+	}
+}
+
+// --------------------------------------------------- concurrent editing
+
+func TestBaselineKeepsWhatAnotherEditorCreated(t *testing.T) {
+	// The canvas loaded when only s1 existed; somebody added s2 since.
+	baseline := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"a"}`)}}
+	current := kong.State{"services": {
+		ent(`{"id":"s1","name":"api","host":"a"}`),
+		ent(`{"id":"s2","name":"billing","host":"b"}`),
+	}}
+	desired := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"c"}`)}}
+
+	p := BuildWith(current, desired, Options{Baseline: baseline})
+	if p.Summary.Delete != 0 {
+		t.Fatalf("a service this canvas never saw must not be deleted: %+v", p.Ops)
+	}
+	if len(p.Ignored) != 1 || p.Ignored[0].EntityID != "s2" {
+		t.Fatalf("expected s2 to be reported as ignored, got %+v", p.Ignored)
+	}
+	if p.Summary.Update != 1 {
+		t.Fatalf("the edit the user did make must still be planned: %+v", p.Ops)
+	}
+
+	// Without a baseline the same canvas would wipe it out — that is exactly
+	// the single-editor behaviour this option exists to replace.
+	if solo := Build(current, desired); solo.Summary.Delete != 1 {
+		t.Fatalf("expected the unscoped plan to delete s2, got %+v", solo.Ops)
+	}
+}
+
+func TestBaselineReportsAnEntityChangedUnderneathTheCanvas(t *testing.T) {
+	baseline := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"a","port":80}`)}}
+	// Another editor moved the port while this canvas was open.
+	current := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"a","port":8443}`)}}
+	desired := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"c","port":80}`)}}
+
+	p := BuildWith(current, desired, Options{Baseline: baseline})
+	if !p.HasConflicts() {
+		t.Fatalf("expected a conflict, got %+v", p)
+	}
+	c := p.Conflicts[0]
+	if c.EntityID != "s1" || c.Op != OpUpdate || c.Reason != ReasonChanged {
+		t.Fatalf("unexpected conflict: %+v", c)
+	}
+	if len(c.Changes) != 1 || c.Changes[0].Field != "port" {
+		t.Fatalf("a conflict must say what the other editor changed: %+v", c.Changes)
+	}
+	// The op is still planned: the plan describes the choice, it does not make it.
+	if p.Summary.Update != 1 {
+		t.Fatalf("expected the update to stay in the plan: %+v", p.Ops)
+	}
+}
+
+func TestBaselineIsQuietWhenNothingDrifted(t *testing.T) {
+	baseline := kong.State{
+		"services": {ent(`{"id":"s1","name":"api","host":"a"}`)},
+		"routes":   {ent(`{"id":"r1","name":"old","paths":["/old"],"service":{"id":"s1"}}`)},
+	}
+	current := kong.State{
+		"services": {ent(`{"id":"s1","name":"api","host":"a","created_at":7}`)},
+		"routes":   {ent(`{"id":"r1","name":"old","paths":["/old"],"service":{"id":"s1"},"updated_at":9}`)},
+	}
+	// The user renamed the service and removed the route.
+	desired := kong.State{
+		"services": {ent(`{"id":"s1","name":"api","host":"b"}`)},
+		"routes":   {},
+	}
+	p := BuildWith(current, desired, Options{Baseline: baseline})
+	if p.HasConflicts() {
+		t.Fatalf("timestamps are not drift: %+v", p.Conflicts)
+	}
+	if p.Summary != (Summary{Update: 1, Delete: 1}) {
+		t.Fatalf("the user's own edits must survive: %+v", p.Summary)
+	}
+}
+
+func TestBaselineFlagsDeletingSomethingSomebodyElseJustEdited(t *testing.T) {
+	baseline := kong.State{"routes": {ent(`{"id":"r1","name":"old","paths":["/old"]}`)}}
+	current := kong.State{"routes": {ent(`{"id":"r1","name":"old","paths":["/moved"]}`)}}
+	desired := kong.State{"routes": {}}
+
+	p := BuildWith(current, desired, Options{Baseline: baseline})
+	if len(p.Conflicts) != 1 || p.Conflicts[0].Op != OpDelete {
+		t.Fatalf("expected a delete conflict, got %+v", p.Conflicts)
+	}
+}
+
+func TestBaselineFlagsRecreatingSomethingSomebodyElseDeleted(t *testing.T) {
+	baseline := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"a"}`)}}
+	current := kong.State{"services": {}}
+	desired := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"a"}`)}}
+
+	p := BuildWith(current, desired, Options{Baseline: baseline})
+	if len(p.Conflicts) != 1 || p.Conflicts[0].Reason != ReasonDeleted {
+		t.Fatalf("expected a delete-elsewhere conflict, got %+v", p.Conflicts)
+	}
+	if p.Summary.Create != 1 {
+		t.Fatalf("the entity should still be offered for re-creation: %+v", p.Ops)
+	}
+}
+
+// ------------------------------------------------------------ rollback
+
+// applied is the shape a recorded run has: a plan plus the result rows that say
+// which of its operations Kong accepted.
+func applied(ops []Op, statuses ...OpStatus) (Plan, Result) {
+	p := Plan{Ops: ops}
+	res := Result{Status: "success"}
+	for i, op := range ops {
+		st := StatusOK
+		if i < len(statuses) {
+			st = statuses[i]
+		}
+		r := OpResult{Index: i, Type: op.Type, Kind: op.Kind, EntityID: op.EntityID, Status: st}
+		if op.Type == OpCreate && IsDraftID(op.EntityID) && st == StatusOK {
+			r.NewID = "real-" + op.Kind
+		}
+		res.Results = append(res.Results, r)
+	}
+	return p, res
+}
+
+func TestRollbackInvertsEveryKindOfOperation(t *testing.T) {
+	p, res := applied([]Op{
+		{Type: OpCreate, Kind: "services", EntityID: "draft:svc", Label: "service new",
+			After: ent(`{"name":"new","host":"a"}`), Payload: ent(`{"name":"new","host":"a"}`)},
+		{Type: OpUpdate, Kind: "routes", EntityID: "r1", Label: "route api",
+			Before:  ent(`{"id":"r1","name":"api","paths":["/old"]}`),
+			After:   ent(`{"id":"r1","name":"api","paths":["/new"]}`),
+			Changes: []FieldChange{{Field: "paths", From: []any{"/old"}, To: []any{"/new"}}}},
+		{Type: OpDelete, Kind: "consumers", EntityID: "c1", Label: "consumer bob",
+			Before: ent(`{"id":"c1","username":"bob"}`)},
+	})
+
+	// Kong as it is now: the created service exists under its real id, the route
+	// carries the new path, the consumer is gone.
+	current := kong.State{
+		"services":  {ent(`{"id":"real-services","name":"new","host":"a"}`)},
+		"routes":    {ent(`{"id":"r1","name":"api","paths":["/new"]}`)},
+		"consumers": {},
+	}
+
+	back := Rollback(p, res, current)
+	if back.HasConflicts() {
+		t.Fatalf("nothing drifted, so nothing should conflict: %+v", back.Conflicts)
+	}
+	if back.Summary != (Summary{Create: 1, Update: 1, Delete: 1}) {
+		t.Fatalf("unexpected summary: %+v", back.Summary)
+	}
+
+	byKind := map[string]Op{}
+	for _, op := range back.Ops {
+		byKind[op.Kind] = op
+	}
+	// What was created is deleted, under the id Kong actually assigned.
+	if op := byKind["services"]; op.Type != OpDelete || op.EntityID != "real-services" {
+		t.Fatalf("create should invert to a delete of the real id: %+v", op)
+	}
+	// What was updated goes back to the value it had, and only that field.
+	if op := byKind["routes"]; op.Type != OpUpdate ||
+		!reflect.DeepEqual(op.Payload["paths"], []any{"/old"}) || len(op.Payload) != 1 {
+		t.Fatalf("update should revert only the field it changed: %+v", op.Payload)
+	}
+	// What was deleted comes back, keeping the id it held.
+	if op := byKind["consumers"]; op.Type != OpCreate || op.Payload["id"] != "c1" ||
+		op.Payload["username"] != "bob" {
+		t.Fatalf("delete should invert to a create with the same id: %+v", op.Payload)
+	}
+}
+
+func TestRollbackLeavesAloneWhatNeverReachedKong(t *testing.T) {
+	p, res := applied([]Op{
+		{Type: OpCreate, Kind: "services", EntityID: "draft:a", Label: "service a", After: ent(`{"name":"a"}`)},
+		{Type: OpCreate, Kind: "services", EntityID: "draft:b", Label: "service b", After: ent(`{"name":"b"}`)},
+	}, StatusOK, StatusError)
+
+	current := kong.State{"services": {ent(`{"id":"real-services","name":"a"}`)}}
+
+	back := Rollback(p, res, current)
+	// Only the operation Kong accepted is undone; the one that errored never
+	// happened, so undoing it would be inventing work.
+	if len(back.Ops) != 1 || back.Ops[0].EntityID != "real-services" {
+		t.Fatalf("expected exactly the accepted create to be undone: %+v", back.Ops)
+	}
+}
+
+func TestRollbackFlagsWhatSomebodyChangedSince(t *testing.T) {
+	p, res := applied([]Op{
+		{Type: OpUpdate, Kind: "services", EntityID: "s1", Label: "service api",
+			Before:  ent(`{"id":"s1","name":"api","host":"old"}`),
+			After:   ent(`{"id":"s1","name":"api","host":"new"}`),
+			Changes: []FieldChange{{Field: "host", From: "old", To: "new"}}},
+	})
+	// Somebody moved the host again after the run being rolled back.
+	current := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"newer"}`)}}
+
+	back := Rollback(p, res, current)
+	if len(back.Conflicts) != 1 || back.Conflicts[0].Reason != ReasonChanged {
+		t.Fatalf("expected a drift conflict, got %+v", back.Conflicts)
+	}
+	// The operation is still offered — the plan describes the choice, the
+	// caller makes it.
+	if back.Summary.Update != 1 {
+		t.Fatalf("expected the revert to still be planned: %+v", back.Summary)
+	}
+}
+
+func TestRollbackDoesNotRecreateSomethingAlreadyBack(t *testing.T) {
+	p, res := applied([]Op{
+		{Type: OpDelete, Kind: "services", EntityID: "s1", Label: "service api",
+			Before: ent(`{"id":"s1","name":"api","host":"a"}`)},
+	})
+	// Somebody recreated it by hand, with different settings.
+	current := kong.State{"services": {ent(`{"id":"s1","name":"api","host":"rebuilt"}`)}}
+
+	back := Rollback(p, res, current)
+	if len(back.Ops) != 0 {
+		t.Fatalf("must not recreate over something that is already there: %+v", back.Ops)
+	}
+	if len(back.Conflicts) != 1 {
+		t.Fatalf("and it has to say so: %+v", back.Conflicts)
+	}
+}
+
+func TestRollbackSkipsWhatIsAlreadyGone(t *testing.T) {
+	p, res := applied([]Op{
+		{Type: OpCreate, Kind: "services", EntityID: "draft:a", Label: "service a", After: ent(`{"name":"a"}`)},
+	})
+	// Somebody already deleted it: the rollback has nothing left to do, and
+	// that is not a conflict, it is the desired end state.
+	back := Rollback(p, res, kong.State{"services": {}})
+	if len(back.Ops) != 0 || back.HasConflicts() {
+		t.Fatalf("expected a quiet no-op: ops=%+v conflicts=%+v", back.Ops, back.Conflicts)
+	}
+}
+
+func TestRollbackDeletesBeforeItRecreates(t *testing.T) {
+	p, res := applied([]Op{
+		{Type: OpCreate, Kind: "services", EntityID: "draft:svc", Label: "service new", After: ent(`{"name":"new"}`)},
+		{Type: OpCreate, Kind: "routes", EntityID: "draft:rt", Label: "route new", After: ent(`{"name":"rt"}`)},
+	})
+	current := kong.State{
+		"services": {ent(`{"id":"real-services","name":"new"}`)},
+		"routes":   {ent(`{"id":"real-routes","name":"rt"}`)},
+	}
+
+	back := Rollback(p, res, current)
+	// Routes must go before the Service they hang off, or Kong refuses.
+	var order []string
+	for _, op := range back.Ops {
+		order = append(order, op.Kind)
+	}
+	if len(order) != 2 || order[0] != "routes" || order[1] != "services" {
+		t.Fatalf("deletes must run child-first: %v", order)
 	}
 }

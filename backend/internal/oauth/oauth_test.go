@@ -78,7 +78,7 @@ func (ts *tokenServer) lastRequest(t *testing.T) recordedRequest {
 }
 
 func sourceFor(ts *tokenServer) *TokenSource {
-	return NewTokenSource(Config{TokenURL: ts.srv.URL, ClientID: "kong-dots", ClientSecret: "s3cr3t"})
+	return NewTokenSource(Config{TokenURL: ts.srv.URL, ClientID: "kong-flow", ClientSecret: "s3cr3t"})
 }
 
 func TestTokenRequestFollowsTheAgreedContract(t *testing.T) {
@@ -96,7 +96,7 @@ func TestTokenRequestFollowsTheAgreedContract(t *testing.T) {
 		t.Errorf("content-type = %q", got)
 	}
 	// RFC 6749 §4.4: the credentials and the grant travel in the form body.
-	if got := req.form.Get("client_id"); got != "kong-dots" {
+	if got := req.form.Get("client_id"); got != "kong-flow" {
 		t.Errorf("client_id = %q", got)
 	}
 	if got := req.form.Get("client_secret"); got != "s3cr3t" {

@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { api } from '../api/client'
 
-const ACTIVE_KEY = 'kong-dots:active-connection'
+const ACTIVE_KEY = 'kong-flow:active-connection'
 
 export const useConnectionsStore = defineStore('connections', {
   state: () => ({

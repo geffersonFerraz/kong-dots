@@ -32,7 +32,7 @@ function statusOf(id) {
         </svg>
       </div>
       <div>
-        <div class="text-sm font-semibold text-slate-100">Kong Dots</div>
+        <div class="text-sm font-semibold text-slate-100">Kong Flow</div>
         <div class="text-[10px] uppercase tracking-wider text-slate-500">Visual manager</div>
       </div>
     </div>

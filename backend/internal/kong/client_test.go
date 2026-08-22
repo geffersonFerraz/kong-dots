@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/gefferson/kong-dots/backend/internal/oauth"
+	"github.com/gefferson/kong-flow/backend/internal/oauth"
 )
 
 // oauthKong pairs a fake authorization server with a fake Admin API that only

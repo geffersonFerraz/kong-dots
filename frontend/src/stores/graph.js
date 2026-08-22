@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import dagre from '@dagrejs/dagre'
 import { api } from '../api/client'
 import { deepClone } from '../api/clone'
+import { useSessionStore } from './session'
 import { DRAFT_PREFIX, KINDS, KIND_META, PLUGIN_PARENT_FIELD, entityLabel, isDraftId, nodeId, refId, splitNodeId, uniqueKeys, validateEntity } from '../api/entities'
 
 const NODE_W = 210
@@ -11,6 +12,13 @@ const emptyState = () => Object.fromEntries(KINDS.map((k) => [k, []]))
 
 let draftSeq = 0
 const nextDraftId = (kind) => `${DRAFT_PREFIX}${kind}-${Date.now().toString(36)}-${++draftSeq}`
+
+// How many edits back Ctrl+Z reaches.
+const UNDO_DEPTH = 50
+
+// Set while an edit is being recorded, so a mutation that calls another one is
+// still a single action.
+let committing = false
 
 export const useGraphStore = defineStore('graph', {
   state: () => ({
@@ -33,6 +41,18 @@ export const useGraphStore = defineStore('graph', {
     applyLog: [],
     lastApply: null,
     toast: null,
+    // Set when this canvas's changes were filed for somebody else to approve.
+    filedRequest: null,
+    // Set when somebody else's change landed in Kong while this canvas was open.
+    remoteChange: null,
+    // Nodes this browser is dragging right now. A remote move for one of them
+    // is ignored: two people cannot both decide where it goes mid-drag.
+    localDrag: [],
+    // Canvas edits this browser made, newest last, and the ones it has undone.
+    // Undo is local: Ctrl+Z takes back what *you* did, not the last thing that
+    // happened on the shared canvas.
+    undoStack: [],
+    redoStack: [],
   }),
 
   getters: {
@@ -259,6 +279,19 @@ export const useGraphStore = defineStore('graph', {
       const p = this.pending
       return p.create + p.update + p.delete > 0
     },
+
+    canUndo: (s) => s.undoStack.length > 0,
+    canRedo: (s) => s.redoStack.length > 0,
+    undoLabel: (s) => s.undoStack.at(-1)?.label ?? '',
+    redoLabel: (s) => s.redoStack.at(-1)?.label ?? '',
+
+    // Entities somebody else changed in Kong after this canvas read them.
+    // Applying over them would quietly undo their work.
+    conflicts: (s) => s.plan?.conflicts ?? [],
+
+    // Entities that appeared in Kong after this canvas loaded. They are left
+    // alone rather than deleted, and shown so nobody wonders where they went.
+    ignored: (s) => s.plan?.ignored ?? [],
   },
 
   actions: {
@@ -304,6 +337,7 @@ export const useGraphStore = defineStore('graph', {
       this.$patch({
         connectionId: null, info: null, baseline: emptyState(), entities: emptyState(),
         positions: {}, selectedNodeId: null, plan: null, applyLog: [], lastApply: null, error: null,
+        filedRequest: null, remoteChange: null, undoStack: [], redoStack: [],
         filter: { query: '', kinds: [], hideUnmatched: false },
       })
     },
@@ -320,6 +354,9 @@ export const useGraphStore = defineStore('graph', {
         this.entities = deepClone(this.baseline)
         this.plan = null
         this.selectedNodeId = null
+        this.remoteChange = null
+        this.undoStack = []
+        this.redoStack = []
         const stored = {}
         for (const [key, pos] of Object.entries(res.layout ?? {})) stored[key] = { x: pos.x, y: pos.y }
         this.positions = keepPositions ? { ...stored, ...this.positions } : stored
@@ -337,7 +374,19 @@ export const useGraphStore = defineStore('graph', {
 
     // ------------------------------------------------------------- layout
 
-    applyAutoLayout({ onlyMissing = false } = {}) {
+    applyAutoLayout(opts = {}) {
+      if (opts.onlyMissing) return this.layoutInner(opts)
+      return this.commit('Auto-layout', () => this.layoutInner(opts))
+    },
+
+    // commitDrag records where nodes ended up, as one undoable step per drag.
+    commitDrag(moved) {
+      this.commit('Move node', () => {
+        for (const { node, position } of moved ?? []) this.setPosition(node, position)
+      })
+    },
+
+    layoutInner({ onlyMissing = false } = {}) {
       const g = new dagre.graphlib.Graph()
       g.setGraph({ rankdir: 'LR', nodesep: 34, ranksep: 110, marginx: 40, marginy: 40 })
       g.setDefaultEdgeLabel(() => ({}))
@@ -361,6 +410,23 @@ export const useGraphStore = defineStore('graph', {
       this.positions = { ...this.positions, [nid]: { x: Math.round(pos.x), y: Math.round(pos.y) } }
     },
 
+    beginLocalDrag(nodeIds) {
+      this.localDrag = nodeIds ?? []
+    },
+
+    endLocalDrag() {
+      this.localDrag = []
+    },
+
+    // applyRemotePosition moves a node because somebody else is dragging it.
+    // Layout is shared per Kong — it lives in canvas_layout, not per user — so
+    // their drag is the canvas's new truth; it just arrives live now instead of
+    // at the next reload. Only the person dragging persists it, on drop.
+    applyRemotePosition(payload) {
+      if (!payload?.node || this.localDrag.includes(payload.node)) return
+      this.setPosition(payload.node, { x: payload.x, y: payload.y })
+    },
+
     async persistLayout() {
       if (!this.connectionId) return
       const positions = Object.entries(this.positions)
@@ -377,19 +443,149 @@ export const useGraphStore = defineStore('graph', {
       }
     },
 
+    // ------------------------------------------------- shared draft + undo
+
+    // commit is the single funnel every canvas edit goes through. It works out
+    // what the edit changed, keeps that so it can be taken back, and hands the
+    // same list to everyone else on this Kong — which is what makes one
+    // person's change show up on the others' canvas straight away.
+    //
+    // Nested calls fold into the outermost one, so `connect`, which edits
+    // through updateEntity, is one action to undo rather than two.
+    commit(label, fn) {
+      if (committing) return fn()
+      committing = true
+      const beforeEntities = entityMap(deepClone(this.entities))
+      const beforePositions = { ...this.positions }
+      let result
+      try {
+        result = fn()
+      } finally {
+        committing = false
+      }
+
+      const changes = diffEntities(beforeEntities, entityMap(deepClone(this.entities)))
+      const positions = diffPositions(beforePositions, this.positions)
+      if (!changes.length && !positions.length) return result
+
+      this.undoStack = [...this.undoStack, { label, changes, positions }].slice(-UNDO_DEPTH)
+      // A new edit is a new branch: whatever was undone cannot be redone onto it.
+      this.redoStack = []
+      this.publish(sideOf(changes, 'after'), positionSide(positions, 'after'))
+      return result
+    },
+
+    // publish sends an edit to the other canvases. Applying it there goes
+    // straight into the entities, never back through commit, or the two
+    // browsers would bounce the same change between them forever.
+    publish(values, positions) {
+      const session = useSessionStore()
+      session.sendCanvasOp(values, positions)
+    },
+
+    undo() {
+      const action = this.undoStack.at(-1)
+      if (!action) return null
+      this.undoStack = this.undoStack.slice(0, -1)
+      this.redoStack = [...this.redoStack, action]
+      this.applySide(action, 'before')
+      return action
+    },
+
+    redo() {
+      const action = this.redoStack.at(-1)
+      if (!action) return null
+      this.redoStack = this.redoStack.slice(0, -1)
+      this.undoStack = [...this.undoStack, action]
+      this.applySide(action, 'after')
+      return action
+    },
+
+    // applySide moves the canvas to one side of a recorded action and tells
+    // everyone else, so an undo travels exactly like the edit it takes back.
+    applySide(action, side) {
+      const values = sideOf(action.changes, side)
+      const positions = positionSide(action.positions ?? [], side)
+      this.applyEntityValues(values)
+      this.applyPositions(positions)
+      this.publish(values, positions)
+    },
+
+    // applyEntityValues is where a change actually lands, whoever it came from:
+    // this browser, an undo, or somebody else's canvas. A null value removes.
+    applyEntityValues(values) {
+      if (!values?.length) return
+      const next = { ...this.entities }
+      for (const { kind, id, value } of values) {
+        if (!KINDS.includes(kind) || !id) continue
+        const current = next[kind] ?? []
+        if (value === null || value === undefined) {
+          next[kind] = current.filter((e) => e.id !== id)
+          const nid = nodeId(kind, id)
+          if (this.selectedNodeId === nid) this.selectedNodeId = null
+          delete this.positions[nid]
+          continue
+        }
+        const at = current.findIndex((e) => e.id === id)
+        next[kind] = at === -1 ? [...current, value] : current.map((e) => (e.id === id ? value : e))
+      }
+      this.entities = next
+    },
+
+    applyPositions(positions) {
+      if (!positions?.length) return
+      const next = { ...this.positions }
+      for (const p of positions) {
+        if (!p?.node) continue
+        if (p.x === undefined || p.x === null) delete next[p.node]
+        else next[p.node] = { x: Math.round(p.x), y: Math.round(p.y) }
+      }
+      this.positions = next
+    },
+
+    // applyRemoteCanvasOp takes somebody else's edit. It does not touch this
+    // browser's undo stack: Ctrl+Z takes back your own work, never theirs.
+    applyRemoteCanvasOp(payload) {
+      const data = payload?.data ?? payload
+      if (!data) return
+      this.applyEntityValues(data.changes ?? [])
+      this.applyPositions(data.positions ?? [])
+    },
+
+    // canvasSnapshot is the whole shared draft, for handing to a tab that has
+    // just opened this Kong and would otherwise see only what Kong reports.
+    canvasSnapshot() {
+      return { entities: deepClone(this.entities), positions: { ...this.positions } }
+    },
+
+    applyStateSync(payload) {
+      const data = payload?.data ?? payload
+      if (!data?.entities) return
+      this.entities = normalizeState(data.entities)
+      if (data.positions) this.positions = { ...this.positions, ...data.positions }
+      // The draft did not come from anything this browser did, so there is
+      // nothing here for it to undo.
+      this.undoStack = []
+      this.redoStack = []
+    },
+
     // ----------------------------------------------------------- mutation
 
     createEntity(kind, patch = {}, position = null) {
-      const entity = { ...KIND_META[kind].defaults(), ...patch, id: nextDraftId(kind) }
-      this.entities[kind] = [...this.entities[kind], entity]
-      const nid = nodeId(kind, entity.id)
-      if (position) this.setPosition(nid, position)
-      this.selectedNodeId = nid
-      return entity
+      return this.commit(`Add ${KIND_META[kind].singular}`, () => {
+        const entity = { ...KIND_META[kind].defaults(), ...patch, id: nextDraftId(kind) }
+        this.entities[kind] = [...this.entities[kind], entity]
+        const nid = nodeId(kind, entity.id)
+        if (position) this.setPosition(nid, position)
+        this.selectedNodeId = nid
+        return entity
+      })
     },
 
     updateEntity(kind, id, patch) {
-      this.entities[kind] = this.entities[kind].map((e) => (e.id === id ? { ...e, ...patch } : e))
+      this.commit(`Edit ${KIND_META[kind].singular}`, () => {
+        this.entities[kind] = this.entities[kind].map((e) => (e.id === id ? { ...e, ...patch } : e))
+      })
     },
 
     // cascade lists everything that would disappear along with an entity, so the
@@ -422,17 +618,24 @@ export const useGraphStore = defineStore('graph', {
     },
 
     deleteEntity(kind, id) {
-      for (const victim of this.cascade(kind, id)) {
-        this.entities[victim.kind] = this.entities[victim.kind].filter((e) => e.id !== victim.id)
-        const nid = nodeId(victim.kind, victim.id)
-        if (this.selectedNodeId === nid) this.selectedNodeId = null
-        delete this.positions[nid]
-      }
+      const label = entityLabel(kind, (this.entities[kind] ?? []).find((e) => e.id === id))
+      this.commit(`Delete ${KIND_META[kind].singular} ${label}`, () => {
+        for (const victim of this.cascade(kind, id)) {
+          this.entities[victim.kind] = this.entities[victim.kind].filter((e) => e.id !== victim.id)
+          const nid = nodeId(victim.kind, victim.id)
+          if (this.selectedNodeId === nid) this.selectedNodeId = null
+          delete this.positions[nid]
+        }
+      })
     },
 
     // connect translates a canvas link into the foreign key Kong actually uses.
     // It returns an error string when the two kinds cannot be related.
     connect(sourceNid, targetNid) {
+      return this.commit('Connect', () => this.connectInner(sourceNid, targetNid))
+    },
+
+    connectInner(sourceNid, targetNid) {
       if (!sourceNid || !targetNid || sourceNid === targetNid) return 'Invalid connection'
       const src = splitNodeId(sourceNid)
       const dst = splitNodeId(targetNid)
@@ -462,6 +665,10 @@ export const useGraphStore = defineStore('graph', {
     },
 
     disconnect(edge) {
+      return this.commit('Disconnect', () => this.disconnectInner(edge))
+    },
+
+    disconnectInner(edge) {
       const relation = edge.data?.relation ?? edge.id.split('|')[0]
       const dst = splitNodeId(edge.target)
       switch (relation) {
@@ -482,13 +689,70 @@ export const useGraphStore = defineStore('graph', {
 
     // ---------------------------------------------------------- clipboard
 
+    // copyClosure lists everything that has to travel with an entity for the
+    // copy to be worth anything on the other side. It is deliberately not
+    // `cascade`: deleting a Service must leave the Upstream it points at alone,
+    // but copying one without that Upstream lands a Service in the other Kong
+    // whose host nothing answers on.
+    copyClosure(kind, id) {
+      const out = []
+      const seen = new Set()
+      const find = (k, i) => (this.entities[k] ?? []).find((e) => e.id === i)
+      const add = (k, entity) => {
+        if (!entity || seen.has(`${k}:${entity.id}`)) return false
+        seen.add(`${k}:${entity.id}`)
+        out.push({ kind: k, id: entity.id, label: entityLabel(k, entity) })
+        return true
+      }
+      const addPlugins = (field, parentId) => {
+        for (const p of this.entities.plugins ?? []) if (refId(p, field) === parentId) add('plugins', p)
+      }
+      const addTargets = (upstreamId) => {
+        for (const t of this.entities.targets ?? []) if (refId(t, 'upstream') === upstreamId) add('targets', t)
+      }
+      const addUpstream = (upstream) => {
+        if (add('upstreams', upstream)) addTargets(upstream.id)
+      }
+      const addRoute = (route) => {
+        if (add('routes', route)) addPlugins('route', route.id)
+      }
+      const addService = (service) => {
+        if (!add('services', service)) return
+        addPlugins('service', service.id)
+        for (const r of this.entities.routes ?? []) if (refId(r, 'service') === service.id) addRoute(r)
+        // A Service names its Upstream instead of referencing it, so the link
+        // survives the copy only if the Upstream comes along under that name.
+        addUpstream((this.entities.upstreams ?? []).find((u) => u.name && u.name === service.host))
+      }
+
+      const root = find(kind, id)
+      if (!root) return out
+      switch (kind) {
+        case 'services':
+          addService(root)
+          break
+        case 'routes':
+          addRoute(root)
+          break
+        case 'consumers':
+          if (add('consumers', root)) addPlugins('consumer', root.id)
+          break
+        case 'upstreams':
+          addUpstream(root)
+          break
+        default:
+          add(kind, root)
+      }
+      return out
+    },
+
     // clipboardBundle serialises an entity and everything that belongs to it —
-    // a Service carries its Routes and every plugin on them. Ids are replaced by
-    // placeholders and references that point outside the bundle are dropped,
-    // because the target is usually a different Kong where those ids mean
-    // nothing.
+    // a Service carries its Routes, every plugin on them and the Upstream it
+    // points at. Ids are replaced by placeholders and references that point
+    // outside the bundle are dropped, because the target is usually a different
+    // Kong where those ids mean nothing.
     clipboardBundle(kind, id) {
-      const members = this.cascade(kind, id)
+      const members = this.copyClosure(kind, id)
       const inBundle = new Map(members.map((m) => [`${m.kind}:${m.id}`, m]))
 
       const idMap = {}
@@ -512,7 +776,7 @@ export const useGraphStore = defineStore('graph', {
 
       const root = (this.entities[kind] ?? []).find((e) => e.id === id)
       return {
-        kong_dots: 1,
+        kong_flow: 1,
         kind,
         label: entityLabel(kind, root),
         copied_at: new Date().toISOString(),
@@ -520,18 +784,70 @@ export const useGraphStore = defineStore('graph', {
       }
     },
 
+    // resolveNameClashes finds free names for a bundle about to be pasted. Kong
+    // makes names unique, so pasting a Service next to the one it was copied
+    // from is a 409 waiting to happen unless the copy is renamed here first.
+    // Returns the field patches per entity, plus the old→new Upstream names so
+    // Services can keep pointing at the right one.
+    resolveNameClashes(bundle) {
+      const claimed = new Set()
+      const claim = (kind, field, value) => value && claimed.add(`${kind}:${field}:${value}`)
+      const isTaken = (kind, field, value) => claimed.has(`${kind}:${field}:${value}`)
+      for (const kind of KINDS) {
+        for (const entity of this.entities[kind] ?? []) {
+          for (const field of UNIQUE_NAME_FIELDS[kind] ?? []) claim(kind, field, entity[field])
+        }
+      }
+
+      const free = (kind, field, original) => {
+        let name = original
+        let n = 0
+        while (isTaken(kind, field, name)) {
+          n += 1
+          name = n === 1 ? `${original}-copy` : `${original}-copy-${n}`
+        }
+        claim(kind, field, name)
+        return name
+      }
+
+      const names = {}
+      const hosts = {}
+      for (const kind of KINDS) {
+        const fields = UNIQUE_NAME_FIELDS[kind] ?? []
+        if (!fields.length) continue
+        for (const entity of bundle.entities[kind] ?? []) {
+          const patch = {}
+          for (const field of fields) {
+            const original = entity?.[field]
+            if (!original) continue
+            const name = free(kind, field, original)
+            if (name === original) continue
+            patch[field] = name
+            if (kind === 'upstreams' && field === 'name') hosts[original] = name
+          }
+          if (Object.keys(patch).length) names[`${kind}:${entity.id}`] = patch
+        }
+      }
+      return { names, hosts }
+    },
+
     // pasteBundle turns a bundle back into draft entities. Fresh ids are minted
     // so the same clipboard can be pasted repeatedly without colliding.
     pasteBundle(bundle, origin = { x: 80, y: 80 }) {
-      if (!bundle || bundle.kong_dots !== 1 || typeof bundle.entities !== 'object') {
-        throw new Error('that does not look like something copied from Kong Dots')
+      if (!bundle || bundle.kong_flow !== 1 || typeof bundle.entities !== 'object') {
+        throw new Error('that does not look like something copied from Kong Flow')
       }
+      return this.commit(`Paste ${bundle.label ?? 'entities'}`, () => this.pasteInner(bundle, origin))
+    },
+
+    pasteInner(bundle, origin) {
       const idMap = {}
       for (const kind of KINDS) {
         for (const entity of bundle.entities[kind] ?? []) {
           if (entity?.id) idMap[entity.id] = nextDraftId(kind)
         }
       }
+      const { names, hosts } = this.resolveNameClashes(bundle)
 
       const created = {}
       let column = 0
@@ -541,6 +857,11 @@ export const useGraphStore = defineStore('graph', {
         list.forEach((entity, row) => {
           const copy = deepClone(entity)
           copy.id = idMap[entity.id] ?? nextDraftId(kind)
+          const renamed = names[`${kind}:${entity.id}`]
+          if (renamed) Object.assign(copy, renamed)
+          // A Service points at its Upstream by name, so a renamed Upstream has
+          // to be followed here or the pasted Service loses its balancer.
+          if (kind === 'services' && hosts[copy.host]) copy.host = hosts[copy.host]
           for (const field of REF_FIELDS) {
             const ref = refId(copy, field)
             copy[field] = ref && idMap[ref] ? { id: idMap[ref] } : null
@@ -559,9 +880,11 @@ export const useGraphStore = defineStore('graph', {
     },
 
     discardChanges() {
-      this.entities = deepClone(this.baseline)
-      this.plan = null
-      this.selectedNodeId = null
+      this.commit('Discard changes', () => {
+        this.entities = deepClone(this.baseline)
+        this.plan = null
+        this.selectedNodeId = null
+      })
     },
 
     // ------------------------------------------------------------ schemas
@@ -583,7 +906,7 @@ export const useGraphStore = defineStore('graph', {
     async buildPlan() {
       this.planning = true
       try {
-        this.plan = await api.plan(this.connectionId, this.desiredPayload())
+        this.plan = await api.plan(this.connectionId, this.changePayload())
         return this.plan
       } catch (e) {
         this.notify(`Could not build the plan: ${e.message}`, 'error')
@@ -593,11 +916,22 @@ export const useGraphStore = defineStore('graph', {
       }
     },
 
-    async apply() {
+    // apply sends the canvas to the backend. What happens there depends on who
+    // is asking: an approver's changes go to Kong, everybody else's are filed
+    // for review and nothing is sent to the gateway.
+    async apply({ force = false, title = '' } = {}) {
       this.applying = true
       this.applyLog = []
       try {
-        const res = await api.apply(this.connectionId, this.desiredPayload())
+        const res = await api.apply(this.connectionId, { ...this.changePayload(), force, title })
+
+        if (res?.status === 'pending_approval') {
+          this.filedRequest = res.request
+          this.plan = null
+          this.notify('Filed for approval — nothing has been sent to Kong yet', 'info')
+          return res
+        }
+
         this.lastApply = res.result
         const ops = res.plan?.ops ?? []
         const idMap = res.result?.id_map ?? {}
@@ -623,6 +957,14 @@ export const useGraphStore = defineStore('graph', {
         this.plan = null
         return res
       } catch (e) {
+        // A 409 means Kong moved underneath this canvas. The backend sends back
+        // the plan it refused to run, drift included, so the review panel can
+        // show exactly whose change is in the way.
+        if (e?.status === 409 && e.body?.plan) {
+          this.plan = e.body.plan
+          this.notify(e.message, 'error')
+          return null
+        }
         // The request itself failed, so nothing is known to have changed —
         // leave the canvas exactly as the user left it.
         this.notify(`Apply failed: ${e.message}`, 'error')
@@ -630,6 +972,18 @@ export const useGraphStore = defineStore('graph', {
       } finally {
         this.applying = false
       }
+    },
+
+    // noteRemoteChange records that somebody else's change reached this Kong,
+    // so the canvas can offer a refresh instead of silently going stale.
+    noteRemoteChange(payload) {
+      const session = useSessionStore()
+      if (!payload || payload.by === session.clientId) return
+      this.remoteChange = { actor: payload.actor ?? 'somebody', summary: payload.summary ?? null, at: Date.now() }
+    },
+
+    dismissRemoteChange() {
+      this.remoteChange = null
     },
 
     // rekeyEntities rewrites draft ids that Kong has now assigned real ids to,
@@ -694,9 +1048,27 @@ export const useGraphStore = defineStore('graph', {
 
     // desiredPayload strips canvas-only fields before the state is diffed.
     desiredPayload() {
-      const out = {}
-      for (const kind of KINDS) out[kind] = (this.entities[kind] ?? []).map(stripRuntimeFields)
-      return out
+      return statePayload(this.entities)
+    },
+
+    // baselinePayload is what Kong looked like when this canvas loaded. The
+    // backend needs it to tell "the user removed this" apart from "somebody
+    // else added this while the canvas was open" — without it, a canvas that
+    // has been open for ten minutes deletes everything created since.
+    baselinePayload() {
+      return statePayload(this.baseline)
+    },
+
+    // changePayload is the whole proposal: the canvas, what it was built on,
+    // and who is proposing it.
+    changePayload() {
+      const session = useSessionStore()
+      return {
+        desired: this.desiredPayload(),
+        baseline: this.baselinePayload(),
+        actor: session.displayName,
+        client_id: session.clientId,
+      }
     },
 
     async exportDeck() {
@@ -716,6 +1088,16 @@ export const useGraphStore = defineStore('graph', {
     },
   },
 })
+
+// The free-form names Kong keeps unique. A pasted copy has to move off any of
+// these that the target Kong already uses. Plugin names (the plugin type) and
+// Target addresses are not free-form, so renaming them would be nonsense.
+const UNIQUE_NAME_FIELDS = {
+  services: ['name'],
+  routes: ['name'],
+  consumers: ['username', 'custom_id'],
+  upstreams: ['name'],
+}
 
 // Foreign-key fields that can point at an entity created in the same apply.
 const REF_FIELDS = ['service', 'route', 'consumer', 'upstream']
@@ -769,6 +1151,63 @@ function normalizeState(state) {
 
 // Kong reports these but never accepts them back.
 const RUNTIME_FIELDS = ['created_at', 'updated_at', 'ws_id']
+
+// entityMap flattens a canvas into key -> entity, which is what makes an edit
+// expressible as a list of entities that changed.
+function entityMap(state) {
+  const out = new Map()
+  for (const kind of KINDS) for (const e of state?.[kind] ?? []) out.set(nodeId(kind, e.id), e)
+  return out
+}
+
+// diffEntities works out what an edit did, one entry per entity touched. A null
+// on either side means the entity was not there: `after: null` is a removal,
+// `before: null` a creation.
+function diffEntities(before, after) {
+  const changes = []
+  for (const [key, entity] of after) {
+    const prev = before.get(key)
+    if (prev && JSON.stringify(prev) === JSON.stringify(entity)) continue
+    const { kind, id } = splitNodeId(key)
+    changes.push({ kind, id, before: prev ?? null, after: entity })
+  }
+  for (const [key, entity] of before) {
+    if (after.has(key)) continue
+    const { kind, id } = splitNodeId(key)
+    changes.push({ kind, id, before: entity, after: null })
+  }
+  return changes
+}
+
+function diffPositions(before, after) {
+  const moved = []
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)])
+  for (const node of keys) {
+    const from = before[node]
+    const to = after[node]
+    if (from && to && from.x === to.x && from.y === to.y) continue
+    if (!from && !to) continue
+    moved.push({ node, before: from ?? null, after: to ?? null })
+  }
+  return moved
+}
+
+// sideOf turns recorded changes into the flat list that goes over the wire and
+// into applyEntityValues: which entity, and what it should now be.
+function sideOf(changes, side) {
+  return changes.map((c) => ({ kind: c.kind, id: c.id, value: c[side] }))
+}
+
+function positionSide(positions, side) {
+  return positions.map((p) => ({ node: p.node, ...(p[side] ?? { x: null, y: null }) }))
+}
+
+// statePayload renders a whole state the way the backend wants to read it.
+function statePayload(state) {
+  const out = {}
+  for (const kind of KINDS) out[kind] = (state?.[kind] ?? []).map(stripRuntimeFields)
+  return out
+}
 
 function stripRuntimeFields(entity) {
   const out = {}

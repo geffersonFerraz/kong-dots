@@ -12,19 +12,19 @@ WORKDIR /src
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
 COPY backend/ ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/kong-dots ./cmd/server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/kong-flow ./cmd/server
 
 # --- runtime ------------------------------------------------------------
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 kongdots
+RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 kongflow
 WORKDIR /app
-COPY --from=api /out/kong-dots /usr/local/bin/kong-dots
+COPY --from=api /out/kong-flow /usr/local/bin/kong-flow
 COPY --from=ui /ui/dist /app/web
-ENV KONGDOTS_ADDR=:8080 \
-    KONGDOTS_DATA_DIR=/data \
-    KONGDOTS_STATIC_DIR=/app/web
-RUN mkdir -p /data && chown kongdots:kongdots /data
-USER kongdots
+ENV KONGFLOW_ADDR=:8080 \
+    KONGFLOW_DATA_DIR=/data \
+    KONGFLOW_STATIC_DIR=/app/web
+RUN mkdir -p /data && chown kongflow:kongflow /data
+USER kongflow
 VOLUME ["/data"]
 EXPOSE 8080
-ENTRYPOINT ["kong-dots"]
+ENTRYPOINT ["kong-flow"]

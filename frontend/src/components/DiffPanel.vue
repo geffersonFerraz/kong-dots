@@ -1,15 +1,25 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useGraphStore } from '../stores/graph'
+import { useSessionStore } from '../stores/session'
 import { KIND_META } from '../api/entities'
 
 const emit = defineEmits(['close', 'focus-node'])
 const graph = useGraphStore()
+const session = useSessionStore()
 
 const issues = computed(() => graph.issues)
 
 const plan = computed(() => graph.plan)
 const ops = computed(() => plan.value?.ops ?? [])
+const conflicts = computed(() => graph.conflicts)
+const ignored = computed(() => graph.ignored)
+
+// What this browser is allowed to do decides the whole footer: an approver
+// applies, everybody else files the change for review.
+const proposesOnly = computed(() => session.proposesOnly)
+const title = ref('')
+const confirmForce = ref(false)
 
 const TYPE_STYLE = {
   create: { sign: '+', text: 'text-emerald-300', chip: 'bg-emerald-500/15 text-emerald-300' },
@@ -42,8 +52,13 @@ function short(value) {
   return s.length > 120 ? `${s.slice(0, 120)}…` : s
 }
 
-async function apply() {
-  await graph.apply()
+async function apply(force = false) {
+  const res = await graph.apply({ force, title: title.value })
+  confirmForce.value = false
+  if (res?.status === 'pending_approval') {
+    title.value = ''
+    emit('close')
+  }
 }
 </script>
 
@@ -85,6 +100,35 @@ async function apply() {
           </p>
         </div>
 
+        <div v-if="conflicts.length" class="border-b border-rose-500/30 bg-rose-500/10 px-5 py-3">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-rose-300">
+            {{ conflicts.length }} thing{{ conflicts.length === 1 ? '' : 's' }} somebody else changed
+          </h3>
+          <ul class="mt-2 space-y-1.5 text-xs text-rose-100">
+            <li v-for="c in conflicts" :key="c.kind + c.entity_id">
+              <button class="text-left hover:underline" @click="emit('focus-node', `${c.kind}:${c.entity_id}`)">
+                <span class="font-medium">{{ c.label }}</span>
+                <span class="text-rose-300/80">
+                  — {{ c.reason === 'deleted' ? 'deleted from Kong since you loaded this canvas' : 'changed in Kong since you loaded this canvas' }}
+                </span>
+              </button>
+              <ul v-if="c.changes?.length" class="mt-0.5 pl-3 font-mono text-[11px] text-rose-200/70">
+                <li v-for="ch in c.changes" :key="ch.field">
+                  {{ ch.field }}: {{ short(ch.from) }} → {{ short(ch.to) }}
+                </li>
+              </ul>
+            </li>
+          </ul>
+          <p class="mt-2 text-[11px] text-rose-300/70">
+            Refreshing takes their version and loses yours for those entities; applying anyway does the opposite.
+          </p>
+        </div>
+
+        <div v-if="ignored.length" class="border-b border-[#232a37] px-5 py-2 text-[11px] text-slate-500">
+          Left untouched because they appeared after you loaded this canvas:
+          {{ ignored.map((i) => i.label).join(', ') }}
+        </div>
+
         <div class="flex gap-2 border-b border-[#232a37] px-5 py-2 text-xs">
           <span class="rounded px-2 py-0.5" :class="TYPE_STYLE.create.chip">{{ plan.summary.create }} to create</span>
           <span class="rounded px-2 py-0.5" :class="TYPE_STYLE.update.chip">{{ plan.summary.update }} to update</span>
@@ -121,6 +165,12 @@ async function apply() {
           <p v-if="graph.lastApply?.error" class="mb-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
             {{ graph.lastApply.error }}
           </p>
+          <input
+            v-if="proposesOnly"
+            v-model="title"
+            placeholder="What is this change for? (shown to the approver)"
+            class="mb-2 w-full rounded-md border border-[#2c3444] bg-[#10131a] px-2.5 py-1.5 text-sm text-slate-200 placeholder:text-slate-600"
+          />
           <div class="flex items-center gap-2">
             <button class="rounded-md border border-[#2c3444] px-3 py-1.5 text-sm text-slate-300 hover:bg-[#222835]" @click="graph.buildPlan()">
               Re-plan
@@ -129,18 +179,52 @@ async function apply() {
             <button class="rounded-md border border-[#2c3444] px-3 py-1.5 text-sm text-slate-300 hover:bg-[#222835]" @click="emit('close')">
               Cancel
             </button>
+
+            <!-- An editor who may not touch this Kong still presses one button;
+                 it files the change instead of running it. -->
             <button
-              class="rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+              v-if="proposesOnly"
+              class="rounded-md bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
               :disabled="graph.applying || issues.length > 0"
               :title="issues.length ? 'Fix the highlighted problems first' : ''"
-              @click="apply"
+              @click="apply()"
             >
-              {{ graph.applying ? 'Applying…' : issues.length ? 'Fix problems to apply' : `Apply ${ops.length} change(s)` }}
+              {{ graph.applying ? 'Filing…' : issues.length ? 'Fix problems first' : `Request approval for ${ops.length} change(s)` }}
+            </button>
+            <button
+              v-else-if="!conflicts.length || confirmForce"
+              class="rounded-md px-4 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+              :class="confirmForce ? 'bg-rose-600 hover:bg-rose-500' : 'bg-emerald-600 hover:bg-emerald-500'"
+              :disabled="graph.applying || issues.length > 0"
+              :title="issues.length ? 'Fix the highlighted problems first' : ''"
+              @click="apply(confirmForce)"
+            >
+              {{
+                graph.applying
+                  ? 'Applying…'
+                  : issues.length
+                    ? 'Fix problems to apply'
+                    : confirmForce
+                      ? 'Overwrite and apply'
+                      : `Apply ${ops.length} change(s)`
+              }}
+            </button>
+            <button
+              v-else
+              class="rounded-md border border-amber-500/50 px-3 py-1.5 text-sm text-amber-300 hover:bg-amber-500/10"
+              @click="confirmForce = true"
+            >
+              Apply despite conflicts…
             </button>
           </div>
           <p class="mt-2 text-[11px] text-slate-500">
-            Operations run in dependency order and stop at the first failure — there is no automatic rollback yet, and every
-            run is recorded in the history.
+            <template v-if="proposesOnly">
+              Nothing is sent to Kong from here — the change waits in the queue until an approver runs it.
+            </template>
+            <template v-else>
+              Operations run in dependency order and stop at the first failure — there is no automatic rollback yet, and
+              every run is recorded in the history.
+            </template>
           </p>
         </footer>
       </template>

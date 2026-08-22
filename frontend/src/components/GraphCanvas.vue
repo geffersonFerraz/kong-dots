@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, unref, watch } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
@@ -10,14 +10,22 @@ import PluginPicker from './PluginPicker.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { useConnectionsStore } from '../stores/connections'
 import { useGraphStore } from '../stores/graph'
+import { useSessionStore } from '../stores/session'
 import { deepClone } from '../api/clone'
 import { KIND_META, routeUrls, splitNodeId } from '../api/entities'
 
 const graph = useGraphStore()
 const connections = useConnectionsStore()
-const { project, fitView } = useVueFlow()
+const session = useSessionStore()
+const { project, fitView, viewport } = useVueFlow()
 
-const nodes = computed(() => graph.nodes)
+// Nodes somebody else has open are marked, so two people notice before they
+// both edit the same Service and one of them loses.
+const nodes = computed(() => {
+  const byNode = session.peersByNode
+  if (!Object.keys(byNode).length) return graph.nodes
+  return graph.nodes.map((n) => (byNode[n.id] ? { ...n, data: { ...n.data, peers: byNode[n.id] } } : n))
+})
 const edges = computed(() => graph.edges)
 
 const menu = ref(null) // { x, y, kind: 'pane'|'node'|'edge', target }
@@ -99,7 +107,7 @@ async function copyEntity(node) {
   try {
     const bundle = graph.clipboardBundle(kind, id)
     await writeClipboard(JSON.stringify(bundle, null, 2))
-    graph.notify(`Copied ${summarise(bundle.entities)} — paste into any Kong Dots workspace`, 'success')
+    graph.notify(`Copied ${summarise(bundle.entities)} — paste into any Kong Flow workspace`, 'success')
   } catch (e) {
     graph.notify(`Could not copy: ${e.message}`, 'error')
   }
@@ -129,7 +137,7 @@ function onPaste(event) {
   } catch {
     return // some other JSON-looking text; not ours to complain about
   }
-  if (bundle?.kong_dots !== 1) return
+  if (bundle?.kong_flow !== 1) return
   event.preventDefault()
   try {
     const created = graph.pasteBundle(bundle, lastPointer.value ?? project({ x: 200, y: 160 }))
@@ -139,13 +147,34 @@ function onPaste(event) {
   }
 }
 
-function onCopyKey(event) {
-  const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target?.tagName)
-  if (typing || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'c') return
-  const selected = graph.selectedNodeId && graph.nodes.find((n) => n.id === graph.selectedNodeId)
-  if (!selected) return
-  event.preventDefault()
-  copyEntity(selected)
+// Canvas keyboard shortcuts. Typing in a field is left alone: Ctrl+Z there
+// belongs to the text box, not to the canvas.
+function onCanvasKey(event) {
+  const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target?.tagName) || event.target?.isContentEditable
+  if (typing || !(event.ctrlKey || event.metaKey)) return
+  const key = event.key.toLowerCase()
+
+  if (key === 'z') {
+    event.preventDefault()
+    // Ctrl+Shift+Z redoes, matching every other editor; Ctrl+Y does too, for
+    // the Windows habit.
+    const action = event.shiftKey ? graph.redo() : graph.undo()
+    if (action) graph.notify(`${event.shiftKey ? 'Redid' : 'Undid'}: ${action.label}`, 'info')
+    else graph.notify(event.shiftKey ? 'Nothing to redo' : 'Nothing to undo', 'info')
+    return
+  }
+  if (key === 'y') {
+    event.preventDefault()
+    const action = graph.redo()
+    if (action) graph.notify(`Redid: ${action.label}`, 'info')
+    return
+  }
+  if (key === 'c') {
+    const selected = graph.selectedNodeId && graph.nodes.find((n) => n.id === graph.selectedNodeId)
+    if (!selected) return
+    event.preventDefault()
+    copyEntity(selected)
+  }
 }
 
 // The mousemove target is often a node, so offsetX/Y would be relative to it;
@@ -153,7 +182,38 @@ function onCopyKey(event) {
 function onPaneMouseMove(event) {
   const rect = container.value?.getBoundingClientRect()
   if (!rect) return
-  lastPointer.value = project({ x: event.clientX - rect.left, y: event.clientY - rect.top })
+  const flow = project({ x: event.clientX - rect.left, y: event.clientY - rect.top })
+  lastPointer.value = flow
+  // Flow coordinates, not screen ones: everyone is panned and zoomed
+  // differently, and a pointer has to land on the same node for all of them.
+  session.sendCursor(flow.x, flow.y)
+}
+
+function onPaneMouseLeave() {
+  session.cursorLeft()
+}
+
+// Where each remote pointer sits on *this* screen. The viewport transform is
+// what turns their flow coordinate into a pixel here.
+const remoteCursors = computed(() => {
+  const vp = unref(viewport) ?? { x: 0, y: 0, zoom: 1 }
+  return Object.values(session.cursors).map((c) => ({
+    id: c.id,
+    name: c.name,
+    color: peerColor(c.id),
+    x: c.x * vp.zoom + vp.x,
+    y: c.y * vp.zoom + vp.y,
+  }))
+})
+
+// A stable colour per tab, so the same person keeps the same pointer while they
+// are here. Hashing the id beats assigning by index, which would reshuffle
+// every time somebody joins or leaves.
+const CURSOR_COLORS = ['#38bdf8', '#f472b6', '#34d399', '#fbbf24', '#a78bfa', '#fb7185']
+function peerColor(id) {
+  let hash = 0
+  for (let i = 0; i < String(id).length; i++) hash = (hash * 31 + String(id).charCodeAt(i)) >>> 0
+  return CURSOR_COLORS[hash % CURSOR_COLORS.length]
 }
 
 async function copyUrl(url) {
@@ -213,8 +273,26 @@ function onConnect(params) {
   if (err) graph.notify(err, 'error')
 }
 
+function onNodeDragStart({ nodes: dragged }) {
+  graph.beginLocalDrag((dragged ?? []).map((n) => n.id))
+}
+
+// Streamed while the pointer is down, so the node travels on everyone's canvas
+// instead of teleporting when it is let go.
+function onNodeDrag({ nodes: dragged }) {
+  for (const node of dragged ?? []) session.sendNodeMove(node.id, node.position.x, node.position.y)
+}
+
 function onNodeDragStop({ nodes: dragged }) {
-  for (const node of dragged ?? []) graph.setPosition(node.id, node.position)
+  for (const node of dragged ?? []) {
+    // Marked final: this is the frame that must not be thrown away by the
+    // throttle, since it is where the node actually ended up.
+    session.sendNodeMove(node.id, node.position.x, node.position.y, true)
+  }
+  // Recorded as one step, so Ctrl+Z puts the node back where it was.
+  graph.commitDrag((dragged ?? []).map((n) => ({ node: n.id, position: n.position })))
+  graph.endLocalDrag()
+  // Only the person who dragged writes the layout; everyone else just follows.
   graph.persistLayout()
 }
 
@@ -245,11 +323,11 @@ function relayout() {
 
 onMounted(() => {
   window.addEventListener('paste', onPaste)
-  window.addEventListener('keydown', onCopyKey)
+  window.addEventListener('keydown', onCanvasKey)
 })
 onUnmounted(() => {
   window.removeEventListener('paste', onPaste)
-  window.removeEventListener('keydown', onCopyKey)
+  window.removeEventListener('keydown', onCanvasKey)
 })
 
 defineExpose({ relayout, focusNode })
@@ -262,7 +340,7 @@ watch(
 </script>
 
 <template>
-  <div ref="container" class="relative h-full w-full" @click="closeMenu">
+  <div ref="container" class="relative h-full w-full" @click="closeMenu" @mouseleave="onPaneMouseLeave">
     <FilterBar @focus-node="focusNode" />
     <VueFlow
       :nodes="nodes"
@@ -274,6 +352,8 @@ watch(
       fit-view-on-init
       class="h-full w-full"
       @connect="onConnect"
+      @node-drag-start="onNodeDragStart"
+      @node-drag="onNodeDrag"
       @node-drag-stop="onNodeDragStop"
       @node-click="onNodeClick"
       @node-context-menu="onNodeContextMenu"
@@ -295,6 +375,28 @@ watch(
         mask-color="rgba(10,13,18,0.75)"
       />
     </VueFlow>
+
+    <!-- Other people's pointers. Purely decorative and never interactive, so it
+         must not intercept a click meant for the canvas underneath. -->
+    <div class="pointer-events-none absolute inset-0 z-40 overflow-hidden">
+      <div
+        v-for="cursor in remoteCursors"
+        :key="cursor.id"
+        class="absolute left-0 top-0 will-change-transform"
+        :style="{ transform: `translate(${cursor.x}px, ${cursor.y}px)` }"
+      >
+        <svg width="18" height="18" viewBox="0 0 18 18" class="drop-shadow">
+          <path d="M2 1 L2 14 L5.5 10.8 L7.9 15.6 L10.1 14.5 L7.8 9.9 L12.4 9.6 Z"
+                :fill="cursor.color" stroke="#0b0e14" stroke-width="1.1" stroke-linejoin="round" />
+        </svg>
+        <span
+          class="ml-3 inline-block whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium text-white shadow"
+          :style="{ backgroundColor: cursor.color }"
+        >
+          {{ cursor.name }}
+        </span>
+      </div>
+    </div>
 
     <div
       v-if="graph.loading"

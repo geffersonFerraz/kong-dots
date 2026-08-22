@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gefferson/kong-dots/backend/internal/oauth"
+	"github.com/gefferson/kong-flow/backend/internal/oauth"
 )
 
 // Entity is a Kong object as returned by the Admin API.

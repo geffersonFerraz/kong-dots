@@ -4,7 +4,7 @@
 // nothing.
 //
 // The database is the one `make test-db` starts; point somewhere else with
-// KONGDOTS_TEST_DATABASE_URL. When none is reachable the tests skip rather than
+// KONGFLOW_TEST_DATABASE_URL. When none is reachable the tests skip rather than
 // fail, so `go test ./...` still works on a machine without Docker.
 package storetest
 
@@ -17,15 +17,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gefferson/kong-dots/backend/internal/store"
+	"github.com/gefferson/kong-flow/backend/internal/store"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-const DefaultDSN = "postgres://kongdots:kongdots@localhost:5433/kongdots_test?sslmode=disable"
+const DefaultDSN = "postgres://kongflow:kongflow@localhost:5433/kongflow_test?sslmode=disable"
 
 // DSN is the test database's connection string.
 func DSN() string {
-	if v := os.Getenv("KONGDOTS_TEST_DATABASE_URL"); v != "" {
+	if v := os.Getenv("KONGFLOW_TEST_DATABASE_URL"); v != "" {
 		return v
 	}
 	return DefaultDSN

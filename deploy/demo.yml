@@ -1,14 +1,14 @@
-# Self-contained demo stack: Kong 3.9.1 + its Postgres, Kong Dots + its own
+# Self-contained demo stack: Kong 3.9.1 + its Postgres, Kong Flow + its own
 # Postgres 18, and a seeded topology whose routes answer with canned JSON
 # (request-termination).
 #
-#   make demo         Kong + demo data + the Kong Dots UI on :8080
-#   make demo-kong    Kong + demo data + the Kong Dots database, for `make api`
+#   make demo         Kong + demo data + the Kong Flow UI on :8080
+#   make demo-kong    Kong + demo data + the Kong Flow database, for `make api`
 #                     / `make ui` running on the host
 #   make demo-down    tear everything down, including volumes
 #
 # Every published port is bound to loopback.
-name: kong-dots-demo
+name: kong-flow-demo
 
 services:
   kong-db:
@@ -49,7 +49,10 @@ services:
       interval: 5s
       retries: 20
     ports:
-      - "127.0.0.1:${KONG_PROXY_PORT:-8000}:8000"
+      - "${KONGFLOW_BIND:-127.0.0.1}:${KONG_PROXY_PORT:-8000}:8000"
+      # The Admin API stays on loopback whatever KONGFLOW_BIND says: it has no
+      # authentication in this stack, and it is full control of the gateway.
+      # Kong Flow reaches it over the compose network, never through this port.
       - "127.0.0.1:${KONG_ADMIN_PORT:-8001}:8001"
 
   # Creates the demo topology and, when the UI container is running, registers
@@ -61,52 +64,59 @@ services:
         condition: service_healthy
     environment:
       KONG_ADMIN: http://kong:8001
-      DOTS_API: http://kong-dots:8080
+      DOTS_API: http://kong-flow:8080
     volumes:
       - ./seed-demo.sh:/seed-demo.sh:ro
     entrypoint: ["sh", "/seed-demo.sh"]
     restart: on-failure
 
-  # Kong Dots' own store (connections, canvas layout, apply history). Separate
+  # Kong Flow' own store (connections, canvas layout, apply history). Separate
   # from kong-db, which is Kong's. Started in both modes and published on
   # loopback, so `make api` on the host uses the same database as `make demo`.
-  kong-dots-db:
+  kong-flow-db:
     image: postgres:18-alpine
     ports:
-      - "127.0.0.1:${KONGDOTS_DB_PORT:-5432}:5432"
+      # Loopback only: this is for `make api` on this machine, not for the network.
+      - "127.0.0.1:${KONGFLOW_DB_PORT:-5432}:5432"
     environment:
-      POSTGRES_USER: kongdots
-      POSTGRES_PASSWORD: kongdots
-      POSTGRES_DB: kongdots
+      POSTGRES_USER: kongflow
+      POSTGRES_PASSWORD: kongflow
+      POSTGRES_DB: kongflow
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kongdots -d kongdots"]
+      test: ["CMD-SHELL", "pg_isready -U kongflow -d kongflow"]
       interval: 3s
       retries: 20
     volumes:
       # Postgres 18 declares /var/lib/postgresql as its volume, not .../data.
-      - kong-dots-db:/var/lib/postgresql
+      - kong-flow-db:/var/lib/postgresql
 
-  kong-dots:
+  kong-flow:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: kong-dots:latest
+    image: kong-flow:latest
     profiles: ["app"]
     depends_on:
       kong:
         condition: service_healthy
-      kong-dots-db:
+      kong-flow-db:
         condition: service_healthy
     environment:
-      # Demo-only key. In a real deployment set KONGDOTS_SECRET_KEY from your
+      # Demo-only key. In a real deployment set KONGFLOW_SECRET_KEY from your
       # secret manager — losing it makes stored Admin API credentials unreadable.
-      KONGDOTS_SECRET_KEY: demo-only-not-a-real-secret
-      KONGDOTS_DATABASE_URL: postgres://kongdots:kongdots@kong-dots-db:5432/kongdots?sslmode=disable
+      KONGFLOW_SECRET_KEY: demo-only-not-a-real-secret
+      KONGFLOW_DATABASE_URL: postgres://kongflow:kongflow@kong-flow-db:5432/kongflow?sslmode=disable
+      # The demo runs with no approvers, so Apply goes straight to Kong. Set
+      # these two to see the review queue instead: everybody else's Apply is
+      # filed as a change request, and only this name — holding this token —
+      # can run it.
+      # KONGFLOW_APPROVERS: alice
+      # KONGFLOW_APPROVER_TOKEN: demo-approval-token
     ports:
-      - "127.0.0.1:${KONGDOTS_PORT:-8080}:8080"
+      - "${KONGFLOW_BIND:-127.0.0.1}:${KONGFLOW_PORT:-8080}:8080"
     volumes:
-      - kong-dots-data:/data
+      - kong-flow-data:/data
 
 volumes:
-  kong-dots-data:
-  kong-dots-db:
+  kong-flow-data:
+  kong-flow-db:

@@ -3,39 +3,45 @@ services:
     image: postgres:18-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${KONGDOTS_DB_USER:-kongdots}
-      POSTGRES_PASSWORD: ${KONGDOTS_DB_PASSWORD:-kongdots}
-      POSTGRES_DB: ${KONGDOTS_DB_NAME:-kongdots}
+      POSTGRES_USER: ${KONGFLOW_DB_USER:-kongflow}
+      POSTGRES_PASSWORD: ${KONGFLOW_DB_PASSWORD:-kongflow}
+      POSTGRES_DB: ${KONGFLOW_DB_NAME:-kongflow}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${KONGDOTS_DB_USER:-kongdots} -d ${KONGDOTS_DB_NAME:-kongdots}"]
+      test: ["CMD-SHELL", "pg_isready -U ${KONGFLOW_DB_USER:-kongflow} -d ${KONGFLOW_DB_NAME:-kongflow}"]
       interval: 5s
       retries: 20
     volumes:
       # Postgres 18 keeps PGDATA under /var/lib/postgresql/18/docker and
       # declares /var/lib/postgresql as its volume — mounting .../data instead
       # would silently lose the database on every restart.
-      - kong-dots-db:/var/lib/postgresql
+      - kong-flow-db:/var/lib/postgresql
 
-  kong-dots:
+  kong-flow:
     build: .
-    image: kong-dots:latest
+    image: kong-flow:latest
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     ports:
-      # Bound to loopback on purpose: expose it through the same Cloudflare
+      # Loopback by default on purpose: expose it through the same Cloudflare
       # Tunnel / Zero Trust used by the rest of the infra, never directly.
-      - "127.0.0.1:8080:8080"
+      # KONGFLOW_BIND=0.0.0.0 opens it to the network — for trying the canvas
+      # from another machine, not for anything that needs to stay private.
+      - "${KONGFLOW_BIND:-127.0.0.1}:8080:8080"
     environment:
       # Set this to a stable value (e.g. from your secret manager). Without it a
       # key is generated into the data volume on first start.
-      KONGDOTS_SECRET_KEY: ${KONGDOTS_SECRET_KEY:-}
-      KONGDOTS_CORS_ORIGINS: ${KONGDOTS_CORS_ORIGINS:-}
-      KONGDOTS_DATABASE_URL: postgres://${KONGDOTS_DB_USER:-kongdots}:${KONGDOTS_DB_PASSWORD:-kongdots}@db:5432/${KONGDOTS_DB_NAME:-kongdots}?sslmode=disable
+      KONGFLOW_SECRET_KEY: ${KONGFLOW_SECRET_KEY:-}
+      KONGFLOW_CORS_ORIGINS: ${KONGFLOW_CORS_ORIGINS:-}
+      # Leave both empty and everyone applies directly. Set them and every other
+      # editor's Apply is filed as a change request for one of these people to run.
+      KONGFLOW_APPROVERS: ${KONGFLOW_APPROVERS:-}
+      KONGFLOW_APPROVER_TOKEN: ${KONGFLOW_APPROVER_TOKEN:-}
+      KONGFLOW_DATABASE_URL: postgres://${KONGFLOW_DB_USER:-kongflow}:${KONGFLOW_DB_PASSWORD:-kongflow}@db:5432/${KONGFLOW_DB_NAME:-kongflow}?sslmode=disable
     volumes:
-      - kong-dots-data:/data
+      - kong-flow-data:/data
 
 volumes:
-  kong-dots-data:
-  kong-dots-db:
+  kong-flow-data:
+  kong-flow-db:

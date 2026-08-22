@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gefferson/kong-dots/backend/internal/kong"
+	"github.com/gefferson/kong-flow/backend/internal/kong"
 )
 
 func TestExportNestsRoutesAndPlugins(t *testing.T) {

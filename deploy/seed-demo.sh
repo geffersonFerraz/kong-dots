@@ -109,15 +109,15 @@ done
 
 log "Kong seeded. Try: curl http://localhost:8000/orders"
 
-# ------------------------------------- register this Kong inside Kong Dots ---
+# ------------------------------------- register this Kong inside Kong Flow ---
 if [ -n "$DOTS_API" ] && curl -sf -o /dev/null "$DOTS_API/healthz"; then
   if curl -sf "$DOTS_API/api/connections" | grep -q '"name":"Demo Kong"'; then
     log "workspace 'Demo Kong' already registered"
   else
     curl -sS -o /dev/null -X POST "$DOTS_API/api/connections" -H 'Content-Type: application/json' \
       -d '{"name":"Demo Kong","admin_api_url":"http://kong:8001","auth_type":"none","environment":"dev","tags":"demo"}'
-    log "registered workspace 'Demo Kong' in Kong Dots"
+    log "registered workspace 'Demo Kong' in Kong Flow"
   fi
 else
-  log "Kong Dots not reachable — skipping workspace registration"
+  log "Kong Flow not reachable — skipping workspace registration"
 fi

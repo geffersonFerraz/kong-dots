@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/gefferson/kong-dots/backend/internal/kong"
+	"github.com/gefferson/kong-flow/backend/internal/kong"
 )
 
 type OpType string
@@ -52,9 +52,54 @@ type Summary struct {
 type Plan struct {
 	Ops     []Op    `json:"ops"`
 	Summary Summary `json:"summary"`
+	// Conflicts are entities another editor changed in Kong after this canvas
+	// read them. Applying anyway would silently undo that other work.
+	Conflicts []Conflict `json:"conflicts,omitempty"`
+	// Ignored are entities that exist in Kong but that this canvas never saw,
+	// so they are left strictly alone instead of being deleted.
+	Ignored []Ignored `json:"ignored,omitempty"`
 }
 
 func (p Plan) IsEmpty() bool { return len(p.Ops) == 0 }
+
+// HasConflicts reports whether applying would overwrite somebody else's work.
+func (p Plan) HasConflicts() bool { return len(p.Conflicts) > 0 }
+
+// Options tunes how a plan is built.
+type Options struct {
+	// Baseline is the live state the canvas was loaded from — what the user
+	// actually saw. With it set, a plan can tell "the user removed this" apart
+	// from "somebody else added this while the canvas was open", and can spot
+	// entities that drifted underneath the canvas. A nil Baseline means the
+	// canvas is assumed to have seen everything that is live now, which is the
+	// single-editor behaviour.
+	Baseline kong.State
+}
+
+// Conflict reports an entity that changed in Kong after this canvas read it,
+// on which the plan nevertheless wants to act.
+type Conflict struct {
+	Kind     string `json:"kind"`
+	EntityID string `json:"entity_id"`
+	Label    string `json:"label"`
+	Op       OpType `json:"op"`     // what this plan wanted to do with it
+	Reason   string `json:"reason"` // changed | deleted
+	// Changes is what the other editor did: baseline → live.
+	Changes []FieldChange `json:"changes,omitempty"`
+}
+
+// Ignored is an entity present in Kong that this canvas never loaded — created
+// by somebody else after the canvas opened. It is never deleted, only reported.
+type Ignored struct {
+	Kind     string `json:"kind"`
+	EntityID string `json:"entity_id"`
+	Label    string `json:"label"`
+}
+
+const (
+	ReasonChanged = "changed"
+	ReasonDeleted = "deleted"
+)
 
 // readOnly fields are server-managed and never sent or diffed.
 var readOnly = map[string]bool{
@@ -65,7 +110,16 @@ var readOnly = map[string]bool{
 // desired are left untouched, so a partial canvas never deletes what it does
 // not know about.
 func Build(current, desired kong.State) Plan {
+	return BuildWith(current, desired, Options{})
+}
+
+// BuildWith is Build with the canvas's baseline taken into account, which is
+// what makes two people editing the same Kong safe: anything that appeared in
+// Kong after this canvas loaded is left alone rather than deleted, and anything
+// that changed underneath it is reported as a conflict rather than reverted.
+func BuildWith(current, desired kong.State, opt Options) Plan {
 	p := Plan{Ops: []Op{}}
+	scoped := opt.Baseline != nil
 	for _, kind := range kong.Kinds {
 		want, present := desired[kind]
 		if !present {
@@ -75,6 +129,21 @@ func Build(current, desired kong.State) Plan {
 		haveByID := map[string]kong.Entity{}
 		for _, e := range have {
 			haveByID[e.ID()] = e
+		}
+		baseByID := map[string]kong.Entity{}
+		if scoped {
+			for _, e := range opt.Baseline[kind] {
+				baseByID[e.ID()] = e
+			}
+		}
+		// drift reports what another editor did to an entity since the canvas
+		// read it, or nil when it is untouched.
+		drift := func(id string, live kong.Entity) []FieldChange {
+			base, known := baseByID[id]
+			if !scoped || !known {
+				return nil
+			}
+			return diffFields(base, live)
 		}
 		seen := map[string]bool{}
 
@@ -90,6 +159,14 @@ func Build(current, desired kong.State) Plan {
 			cur, ok := haveByID[id]
 			if !ok {
 				// The canvas thinks it exists but Kong does not — recreate it.
+				// When the canvas did see it, its disappearance is somebody
+				// else's delete, not a drift the user asked to undo.
+				if _, known := baseByID[id]; scoped && known {
+					p.Conflicts = append(p.Conflicts, Conflict{
+						Kind: kind, EntityID: id, Label: label(kind, d),
+						Op: OpCreate, Reason: ReasonDeleted,
+					})
+				}
 				p.Ops = append(p.Ops, Op{
 					Type: OpCreate, Kind: kind, EntityID: id,
 					Label: label(kind, d), After: d, Payload: sanitize(d),
@@ -100,6 +177,12 @@ func Build(current, desired kong.State) Plan {
 			changes := diffFields(cur, d)
 			if len(changes) == 0 {
 				continue
+			}
+			if moved := drift(id, cur); len(moved) > 0 {
+				p.Conflicts = append(p.Conflicts, Conflict{
+					Kind: kind, EntityID: id, Label: label(kind, cur),
+					Op: OpUpdate, Reason: ReasonChanged, Changes: moved,
+				})
 			}
 			// PATCH is partial, so only changed fields are sent. Targets are
 			// immutable in Kong and get replaced, so they need the whole entity.
@@ -118,12 +201,28 @@ func Build(current, desired kong.State) Plan {
 		}
 
 		for _, cur := range have {
-			if !seen[cur.ID()] {
-				p.Ops = append(p.Ops, Op{
-					Type: OpDelete, Kind: kind, EntityID: cur.ID(),
-					Label: label(kind, cur), Before: cur, Payload: cur,
-				})
+			id := cur.ID()
+			if seen[id] {
+				continue
 			}
+			if scoped {
+				if _, known := baseByID[id]; !known {
+					// Never in this canvas, so its absence is not a removal —
+					// somebody created it while the canvas was open.
+					p.Ignored = append(p.Ignored, Ignored{Kind: kind, EntityID: id, Label: label(kind, cur)})
+					continue
+				}
+				if moved := drift(id, cur); len(moved) > 0 {
+					p.Conflicts = append(p.Conflicts, Conflict{
+						Kind: kind, EntityID: id, Label: label(kind, cur),
+						Op: OpDelete, Reason: ReasonChanged, Changes: moved,
+					})
+				}
+			}
+			p.Ops = append(p.Ops, Op{
+				Type: OpDelete, Kind: kind, EntityID: id,
+				Label: label(kind, cur), Before: cur, Payload: cur,
+			})
 		}
 	}
 	sortOps(p.Ops)

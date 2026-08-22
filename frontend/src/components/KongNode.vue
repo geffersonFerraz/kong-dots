@@ -24,6 +24,11 @@ const hasSource = computed(() => ['services', 'routes', 'consumers', 'upstreams'
 
 const issues = computed(() => props.data.issues ?? [])
 
+// Other editors with this node open right now.
+const peers = computed(() => props.data.peers ?? [])
+const peersLabel = computed(() => peers.value.map((p) => p.name).join(', '))
+const initials = (name) => (name ?? '?').trim().slice(0, 2).toUpperCase()
+
 const attachment = computed(() => {
   const e = props.data.entity
   if (props.data.kind !== 'plugins') return null
@@ -40,6 +45,7 @@ const attachment = computed(() => {
     :class="[
       issues.length ? 'border-amber-400/80' : data.draft ? 'border-dashed border-sky-400/70' : 'border-[#2c3444]',
       data.dimmed ? 'opacity-25' : '',
+      peers.length ? 'ring-1 ring-sky-400/50' : '',
     ]"
   >
     <Handle v-if="hasTarget" type="target" :position="Position.Left" />
@@ -65,7 +71,20 @@ const attachment = computed(() => {
         off
       </span>
     </div>
-    <div class="px-2.5 py-2">
+    <div class="relative px-2.5 py-2">
+      <div
+        v-if="peers.length"
+        class="absolute -top-2 right-2 flex gap-0.5"
+        :title="`${peersLabel} ${peers.length === 1 ? 'has' : 'have'} this open`"
+      >
+        <span
+          v-for="p in peers.slice(0, 3)"
+          :key="p.id"
+          class="grid h-4 w-4 place-items-center rounded-full bg-sky-500/80 text-[8px] font-bold text-white ring-1 ring-[#1b202b]"
+        >
+          {{ initials(p.name) }}
+        </span>
+      </div>
       <div class="truncate text-sm font-medium text-slate-100" :title="label">{{ label }}</div>
       <div class="truncate text-[11px] text-slate-400" :title="subtitle">{{ subtitle }}</div>
       <div v-if="attachment" class="mt-0.5 text-[10px] text-slate-500">{{ attachment }}</div>

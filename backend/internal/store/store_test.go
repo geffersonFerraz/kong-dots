@@ -2,10 +2,11 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	"github.com/gefferson/kong-dots/backend/internal/store"
-	"github.com/gefferson/kong-dots/backend/internal/storetest"
+	"github.com/gefferson/kong-flow/backend/internal/store"
+	"github.com/gefferson/kong-flow/backend/internal/storetest"
 )
 
 func TestOAuthFieldsRoundTrip(t *testing.T) {
@@ -15,7 +16,7 @@ func TestOAuthFieldsRoundTrip(t *testing.T) {
 	want := store.Connection{
 		ID: "c1", Name: "oauth kong", AdminAPIURL: "https://kong.internal:8444",
 		AuthType: "oauth2", OAuthTokenURL: "https://idp.internal/oauth2/token",
-		OAuthClientID: "kong-dots", OAuthClientSecret: "encrypted-blob",
+		OAuthClientID: "kong-flow", OAuthClientSecret: "encrypted-blob",
 		Environment: "prod", TLSSkipVerify: true,
 	}
 	if err := st.CreateConnection(ctx, want); err != nil {
@@ -166,4 +167,89 @@ func TestLayoutUpsertAndHistoryOrder(t *testing.T) {
 	if entries, _ := st.ListHistory(ctx, "c1", 10); len(entries) != 0 {
 		t.Errorf("history outlived the connection: %+v", entries)
 	}
+}
+
+func TestChangeRequestIsDecidedExactlyOnce(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+
+	cr := store.ChangeRequest{
+		ID: "req-1", ConnectionID: "conn-1", Title: "add billing",
+		DesiredJSON: `{"services":[]}`, BaselineJSON: `{"services":[]}`,
+		PlanJSON:    `{"summary":{"create":1,"update":0,"delete":0}}`,
+		RequestedBy: "bob",
+	}
+	if err := st.CreateChangeRequest(ctx, cr); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := st.GetChangeRequest(ctx, "req-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != store.RequestPending || got.RequestedBy != "bob" || got.RequestedAt == "" {
+		t.Fatalf("unexpected request: %+v", got)
+	}
+
+	if n, err := st.CountPendingRequests(ctx, "conn-1"); err != nil || n != 1 {
+		t.Fatalf("pending count = %d, %v", n, err)
+	}
+
+	// Two approvers pressing at the same moment: the guard is what stops the
+	// second one from applying a change that already ran.
+	if err := st.Review(ctx, "req-1", store.RequestApplied, "alice", "ok", `{"status":"success"}`, ""); err != nil {
+		t.Fatalf("first review: %v", err)
+	}
+	if err := st.Review(ctx, "req-1", store.RequestRejected, "carol", "too late", "", ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a decided request must not be decided again, got %v", err)
+	}
+
+	got, _ = st.GetChangeRequest(ctx, "req-1")
+	if got.Status != store.RequestApplied || got.ReviewedBy != "alice" || got.ReviewedAt == "" {
+		t.Fatalf("first verdict should stand: %+v", got)
+	}
+	if n, _ := st.CountPendingRequests(ctx, "conn-1"); n != 0 {
+		t.Fatalf("expected no pending requests left, got %d", n)
+	}
+
+	// Listing is scoped to one connection and filterable by status.
+	pending, err := st.ListChangeRequests(ctx, "conn-1", store.RequestPending, 0)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending list = %v, %v", pending, err)
+	}
+	all, _ := st.ListChangeRequests(ctx, "conn-1", "", 0)
+	if len(all) != 1 {
+		t.Fatalf("expected the decided request to remain listed: %v", all)
+	}
+	if other, _ := st.ListChangeRequests(ctx, "conn-2", "", 0); len(other) != 0 {
+		t.Fatalf("another Kong's queue leaked in: %v", other)
+	}
+}
+
+func TestOnlyOneApplyHoldsTheConnectionLock(t *testing.T) {
+	st := storetest.New(t)
+	ctx := context.Background()
+
+	release, ok, err := st.LockConnection(ctx, "conn-1")
+	if err != nil || !ok {
+		t.Fatalf("first lock: ok=%v err=%v", ok, err)
+	}
+
+	// A second apply against the same Kong is turned away rather than queued.
+	if _, ok, err := st.LockConnection(ctx, "conn-1"); err != nil || ok {
+		t.Fatalf("second lock should fail: ok=%v err=%v", ok, err)
+	}
+	// A different Kong is unaffected.
+	otherRelease, ok, err := st.LockConnection(ctx, "conn-2")
+	if err != nil || !ok {
+		t.Fatalf("unrelated connection should lock: ok=%v err=%v", ok, err)
+	}
+	otherRelease()
+
+	release()
+	again, ok, err := st.LockConnection(ctx, "conn-1")
+	if err != nil || !ok {
+		t.Fatalf("lock should be free after release: ok=%v err=%v", ok, err)
+	}
+	again()
 }

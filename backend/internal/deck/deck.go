@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/gefferson/kong-dots/backend/internal/kong"
-	"github.com/gefferson/kong-dots/backend/internal/plan"
+	"github.com/gefferson/kong-flow/backend/internal/kong"
+	"github.com/gefferson/kong-flow/backend/internal/plan"
 	"gopkg.in/yaml.v3"
 )
 

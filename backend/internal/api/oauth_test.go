@@ -89,7 +89,7 @@ func (e *oauthEnv) onlyAccept(token string) {
 func (e *oauthEnv) connectionBody() map[string]any {
 	return map[string]any{
 		"name": "oauth-kong", "admin_api_url": e.kong.URL, "auth_type": "oauth2",
-		"oauth_token_url": e.idp.URL, "oauth_client_id": "kong-dots", "oauth_client_secret": "s3cr3t",
+		"oauth_token_url": e.idp.URL, "oauth_client_id": "kong-flow", "oauth_client_secret": "s3cr3t",
 	}
 }
 
@@ -130,7 +130,7 @@ func TestOAuthConnectionNeverReturnsTheClientSecret(t *testing.T) {
 	if created["has_oauth_secret"] != true {
 		t.Errorf("has_oauth_secret should be true: %v", created)
 	}
-	if created["oauth_client_id"] != "kong-dots" || created["oauth_token_url"] != env.idp.URL {
+	if created["oauth_client_id"] != "kong-flow" || created["oauth_token_url"] != env.idp.URL {
 		t.Errorf("oauth settings not stored: %v", created)
 	}
 
@@ -216,7 +216,7 @@ func TestRotatingTheClientSecretRetiresTheCachedToken(t *testing.T) {
 
 	body := env.connectionBody()
 	body["oauth_client_secret"] = "s3cr3t" // same value, but resent explicitly
-	body["oauth_client_id"] = "kong-dots-rotated"
+	body["oauth_client_id"] = "kong-flow-rotated"
 	if rec, _ := do(t, h, http.MethodPut, "/api/connections/"+id, body); rec.Code != http.StatusOK {
 		t.Fatalf("update: %d", rec.Code)
 	}

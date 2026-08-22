@@ -56,7 +56,7 @@ describe('ConnectionDialog — OAuth2 client credentials', () => {
     await field(wrapper, 'Token URL').setValue('https://idp.example.com/oauth2/token')
     expect(buttonNamed(wrapper, 'Save').attributes('disabled')).toBeDefined()
 
-    await field(wrapper, 'Client ID').setValue('kong-dots')
+    await field(wrapper, 'Client ID').setValue('kong-flow')
     expect(buttonNamed(wrapper, 'Save').attributes('disabled')).toBeUndefined()
   })
 
@@ -68,7 +68,7 @@ describe('ConnectionDialog — OAuth2 client credentials', () => {
     await field(wrapper, 'Admin API URL').setValue('https://kong.internal:8444')
     await selectOAuth(wrapper)
     await field(wrapper, 'Token URL').setValue('https://idp.example.com/oauth2/token')
-    await field(wrapper, 'Client ID').setValue('kong-dots')
+    await field(wrapper, 'Client ID').setValue('kong-flow')
     await field(wrapper, 'Client secret').setValue('s3cr3t')
     await buttonNamed(wrapper, 'Save').trigger('click')
 
@@ -76,7 +76,7 @@ describe('ConnectionDialog — OAuth2 client credentials', () => {
       expect.objectContaining({
         auth_type: 'oauth2',
         oauth_token_url: 'https://idp.example.com/oauth2/token',
-        oauth_client_id: 'kong-dots',
+        oauth_client_id: 'kong-flow',
         oauth_client_secret: 's3cr3t',
       }),
     )
@@ -86,7 +86,7 @@ describe('ConnectionDialog — OAuth2 client credentials', () => {
     api.updateConnection.mockResolvedValue({ id: 'c1' })
     const wrapper = mountDialog({
       id: 'c1', name: 'oauth kong', admin_api_url: 'https://kong.internal:8444',
-      auth_type: 'oauth2', oauth_token_url: 'https://idp/token', oauth_client_id: 'kong-dots',
+      auth_type: 'oauth2', oauth_token_url: 'https://idp/token', oauth_client_id: 'kong-flow',
       has_oauth_secret: true, environment: 'prod',
     })
 
@@ -97,14 +97,14 @@ describe('ConnectionDialog — OAuth2 client credentials', () => {
     const [, sent] = api.updateConnection.mock.calls.at(-1)
     expect(sent.name).toBe('renamed')
     expect(sent).not.toHaveProperty('oauth_client_secret')
-    expect(sent.oauth_client_id).toBe('kong-dots')
+    expect(sent.oauth_client_id).toBe('kong-flow')
   })
 
   it('sends a retyped client secret', async () => {
     api.updateConnection.mockResolvedValue({ id: 'c1' })
     const wrapper = mountDialog({
       id: 'c1', name: 'oauth kong', admin_api_url: 'https://kong.internal:8444',
-      auth_type: 'oauth2', oauth_token_url: 'https://idp/token', oauth_client_id: 'kong-dots',
+      auth_type: 'oauth2', oauth_token_url: 'https://idp/token', oauth_client_id: 'kong-flow',
       has_oauth_secret: true,
     })
 

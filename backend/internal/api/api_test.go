@@ -9,15 +9,18 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/gefferson/kong-dots/backend/internal/cryptox"
-	"github.com/gefferson/kong-dots/backend/internal/storetest"
+	"github.com/gefferson/kong-flow/backend/internal/cryptox"
+	"github.com/gefferson/kong-flow/backend/internal/storetest"
 )
 
 // fakeKong is a stand-in Admin API: it keeps whatever is POSTed so tests can
 // assert on what the tool actually persisted.
 type fakeKong struct {
-	mu       sync.Mutex
-	created  map[string][]map[string]any
+	mu      sync.Mutex
+	created map[string][]map[string]any
+	// deleted records the paths a DELETE reached, which is how a rollback is
+	// checked to have actually removed what it said it would.
+	deleted  []string
 	services []map[string]any
 	srv      *httptest.Server
 }
@@ -46,6 +49,11 @@ func newFakeKong(t *testing.T) *fakeKong {
 			f.mu.Unlock()
 			body["id"] = id
 			writeJSONTest(w, body)
+		case r.Method == http.MethodDelete:
+			f.mu.Lock()
+			f.deleted = append(f.deleted, r.URL.Path)
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodGet && r.URL.Path == "/services":
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -68,12 +76,44 @@ func writeJSONTest(w http.ResponseWriter, v any) {
 
 func newTestServer(t *testing.T) http.Handler {
 	t.Helper()
+	// No approvers configured: every editor applies directly, which is the
+	// behaviour most of these tests are about.
+	return newTestServerWith(t, Approval{})
+}
+
+// newTestServerWith builds a server whose apply is gated on review.
+func newTestServerWith(t *testing.T, approval Approval) http.Handler {
+	t.Helper()
 	st := storetest.New(t)
 	cipher, err := cryptox.New("unit-test-key")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(st, cipher, NewHub(nil)).Router([]string{"*"}, "")
+	return NewServer(st, cipher, NewHub(nil), approval).Router([]string{"*"}, "")
+}
+
+// asActor is `do` with a name (and optionally an approval token) attached, the
+// way the browser identifies itself.
+func asActor(t *testing.T, h http.Handler, actor, token, method, path string, body any) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	var reader *strings.Reader
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		reader = strings.NewReader(string(raw))
+	} else {
+		reader = strings.NewReader("")
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerActor, actor)
+	if token != "" {
+		req.Header.Set(headerToken, token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	out := map[string]any{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	return rec, out
 }
 
 func do(t *testing.T, h http.Handler, method, path string, body any) (*httptest.ResponseRecorder, map[string]any) {
@@ -381,5 +421,351 @@ func TestBaseURLIsStoredAndValidated(t *testing.T) {
 	}
 	if !strings.Contains(fmt.Sprint(body["error"]), "base_url") {
 		t.Errorf("error should name the field: %v", body["error"])
+	}
+}
+
+// ------------------------------------------------- approval queue
+
+// desiredWithOneService is the smallest canvas that asks Kong for something.
+func desiredWithOneService(name string) map[string]any {
+	return map[string]any{
+		"desired": map[string]any{
+			"services":  []map[string]any{{"id": "draft:svc", "name": name, "host": name + ".internal", "port": 80}},
+			"routes":    []map[string]any{},
+			"plugins":   []map[string]any{},
+			"consumers": []map[string]any{},
+			"upstreams": []map[string]any{},
+			"targets":   []map[string]any{},
+		},
+		"baseline": map[string]any{
+			"services": []map[string]any{}, "routes": []map[string]any{}, "plugins": []map[string]any{},
+			"consumers": []map[string]any{}, "upstreams": []map[string]any{}, "targets": []map[string]any{},
+		},
+		"title": "add " + name,
+	}
+}
+
+func TestEditorsApplyIntoTheQueueInsteadOfIntoKong(t *testing.T) {
+	h := newTestServerWith(t, Approval{Approvers: []string{"alice"}})
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	rec, body := asActor(t, h, "bob", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected the change to be queued (202), got %d %s", rec.Code, rec.Body)
+	}
+	if body["status"] != "pending_approval" {
+		t.Fatalf("an editor's apply must not reach Kong: %v", body)
+	}
+	fake.mu.Lock()
+	reached := len(fake.created["services"])
+	fake.mu.Unlock()
+	if reached != 0 {
+		t.Fatalf("%d service(s) reached Kong without approval", reached)
+	}
+
+	request := body["request"].(map[string]any)
+	if request["requested_by"] != "bob" || request["status"] != "pending" {
+		t.Fatalf("unexpected request: %v", request)
+	}
+
+	// It is waiting where an approver can find it.
+	rec, listed := asActor(t, h, "alice", "", http.MethodGet, "/api/connections/"+id+"/requests?status=pending", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list requests: %d %s", rec.Code, rec.Body)
+	}
+	if reqs := listed["requests"].([]any); len(reqs) != 1 {
+		t.Fatalf("expected one pending request, got %v", reqs)
+	}
+	if identity := listed["identity"].(map[string]any); identity["approver"] != true {
+		t.Fatalf("alice is on the approver list: %v", identity)
+	}
+}
+
+func TestOnlyAnApproverCanPushAQueuedChange(t *testing.T) {
+	h := newTestServerWith(t, Approval{Approvers: []string{"alice"}})
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	_, body := asActor(t, h, "bob", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	reqID := body["request"].(map[string]any)["id"].(string)
+	approve := "/api/connections/" + id + "/requests/" + reqID + "/approve"
+
+	// Bob cannot wave his own change through.
+	if rec, _ := asActor(t, h, "bob", "", http.MethodPost, approve, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a non-approver, got %d %s", rec.Code, rec.Body)
+	}
+
+	rec, out := asActor(t, h, "alice", "", http.MethodPost, approve, map[string]any{"note": "looks fine"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve: %d %s", rec.Code, rec.Body)
+	}
+	if status := out["result"].(map[string]any)["status"]; status != "success" {
+		t.Fatalf("apply status %v: %s", status, rec.Body)
+	}
+	fake.mu.Lock()
+	created := fake.created["services"]
+	fake.mu.Unlock()
+	if len(created) != 1 || created[0]["name"] != "billing" {
+		t.Fatalf("the approved change did not reach Kong: %v", created)
+	}
+
+	// A decided request cannot be applied twice.
+	if rec, _ := asActor(t, h, "alice", "", http.MethodPost, approve, nil); rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on a second approval, got %d %s", rec.Code, rec.Body)
+	}
+
+	// And it is recorded against the person who approved it.
+	rec, _ = asActor(t, h, "alice", "", http.MethodGet, "/api/connections/"+id+"/history", nil)
+	var history []map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &history)
+	if len(history) != 1 || !strings.Contains(fmt.Sprint(history[0]["actor"]), "alice") ||
+		!strings.Contains(fmt.Sprint(history[0]["actor"]), "bob") {
+		t.Errorf("history should name both the approver and the author: %s", rec.Body)
+	}
+}
+
+func TestApprovalTokenIsRequiredWhenOneIsConfigured(t *testing.T) {
+	h := newTestServerWith(t, Approval{Approvers: []string{"alice"}, Token: "s3cret"})
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	// The right name without the token is still just an editor.
+	rec, body := asActor(t, h, "alice", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	if rec.Code != http.StatusAccepted || body["status"] != "pending_approval" {
+		t.Fatalf("a name alone must not grant approval: %d %s", rec.Code, rec.Body)
+	}
+	reqID := body["request"].(map[string]any)["id"].(string)
+
+	// The token in somebody else's hands is not enough either.
+	approve := "/api/connections/" + id + "/requests/" + reqID + "/approve"
+	if rec, _ := asActor(t, h, "mallory", "s3cret", http.MethodPost, approve, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a token holder who is not on the list, got %d %s", rec.Code, rec.Body)
+	}
+
+	if rec, _ := asActor(t, h, "alice", "s3cret", http.MethodPost, approve, nil); rec.Code != http.StatusOK {
+		t.Fatalf("approve with name and token: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestRejectedRequestNeverReachesKong(t *testing.T) {
+	h := newTestServerWith(t, Approval{Approvers: []string{"alice"}})
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	_, body := asActor(t, h, "bob", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	reqID := body["request"].(map[string]any)["id"].(string)
+
+	rec, out := asActor(t, h, "alice", "", http.MethodPost,
+		"/api/connections/"+id+"/requests/"+reqID+"/reject", map[string]any{"note": "use the shared upstream"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reject: %d %s", rec.Code, rec.Body)
+	}
+	request := out["request"].(map[string]any)
+	if request["status"] != "rejected" || request["review_note"] != "use the shared upstream" {
+		t.Fatalf("unexpected request after reject: %v", request)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if n := len(fake.created["services"]); n != 0 {
+		t.Fatalf("a rejected change reached Kong (%d services)", n)
+	}
+}
+
+func TestAuthorCanWithdrawTheirOwnRequest(t *testing.T) {
+	h := newTestServerWith(t, Approval{Approvers: []string{"alice"}})
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	_, body := asActor(t, h, "bob", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	reqID := body["request"].(map[string]any)["id"].(string)
+	withdraw := "/api/connections/" + id + "/requests/" + reqID + "/withdraw"
+
+	if rec, _ := asActor(t, h, "carol", "", http.MethodPost, withdraw, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 withdrawing somebody else's request, got %d %s", rec.Code, rec.Body)
+	}
+	if rec, _ := asActor(t, h, "bob", "", http.MethodPost, withdraw, nil); rec.Code != http.StatusOK {
+		t.Fatalf("bob should be able to take back his own request: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestWithoutApproversEveryoneAppliesDirectly(t *testing.T) {
+	h := newTestServer(t) // no approvers configured
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	rec, _ := asActor(t, h, "bob", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a single-operator install must keep applying directly: %d %s", rec.Code, rec.Body)
+	}
+	rec, me := do(t, h, http.MethodGet, "/api/me", nil)
+	if rec.Code != http.StatusOK || me["approver"] != true || me["approval_required"] != false {
+		t.Fatalf("unexpected identity: %v", me)
+	}
+}
+
+func TestQueuedChangeIsRePlannedAgainstKongAtApprovalTime(t *testing.T) {
+	h := newTestServerWith(t, Approval{Approvers: []string{"alice"}})
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	// Bob's canvas saw an empty Kong and proposes deleting nothing.
+	_, body := asActor(t, h, "bob", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	reqID := body["request"].(map[string]any)["id"].(string)
+
+	// Meanwhile somebody adds a service straight into Kong.
+	fake.mu.Lock()
+	fake.services = []map[string]any{{"id": "s-out-of-band", "name": "legacy", "host": "legacy.internal"}}
+	fake.mu.Unlock()
+
+	// The plan the approver is shown is built against Kong as it is now, and it
+	// leaves the service Bob never saw alone.
+	rec, out := asActor(t, h, "alice", "", http.MethodGet, "/api/connections/"+id+"/requests/"+reqID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get request: %d %s", rec.Code, rec.Body)
+	}
+	fresh := out["plan"].(map[string]any)
+	if summary := fresh["summary"].(map[string]any); summary["delete"] != float64(0) {
+		t.Fatalf("a queued change must not delete what its author never saw: %v", summary)
+	}
+	if ignored := fresh["ignored"].([]any); len(ignored) != 1 {
+		t.Fatalf("expected the out-of-band service to be reported as ignored: %v", fresh["ignored"])
+	}
+}
+
+// ------------------------------------------------------------- rollback
+
+func TestRollbackUndoesARunAndIsItselfRecorded(t *testing.T) {
+	h := newTestServer(t)
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	// Apply something, then find it in the history.
+	rec, _ := do(t, h, http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply: %d %s", rec.Code, rec.Body)
+	}
+	rec, _ = do(t, h, http.MethodGet, "/api/connections/"+id+"/history", nil)
+	var history []map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &history)
+	if len(history) != 1 {
+		t.Fatalf("expected one run in the history: %s", rec.Body)
+	}
+	runID := history[0]["id"].(string)
+
+	// Kong now reports the service that run created.
+	fake.mu.Lock()
+	fake.services = []map[string]any{{"id": "services-1", "name": "billing", "host": "billing.internal", "port": float64(80)}}
+	fake.mu.Unlock()
+
+	// The preview says what undoing it would do, without doing it.
+	rec, preview := do(t, h, http.MethodGet, "/api/connections/"+id+"/history/"+runID+"/rollback", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preview: %d %s", rec.Code, rec.Body)
+	}
+	summary := preview["plan"].(map[string]any)["summary"].(map[string]any)
+	if summary["delete"] != float64(1) {
+		t.Fatalf("undoing a create should delete it: %v", summary)
+	}
+	fake.mu.Lock()
+	deletedBefore := len(fake.deleted)
+	fake.mu.Unlock()
+	if deletedBefore != 0 {
+		t.Fatalf("a preview must not touch Kong (%d deletes)", deletedBefore)
+	}
+
+	// Running it does reach Kong.
+	rec, out := do(t, h, http.MethodPost, "/api/connections/"+id+"/history/"+runID+"/rollback", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rollback: %d %s", rec.Code, rec.Body)
+	}
+	if status := out["result"].(map[string]any)["status"]; status != "success" {
+		t.Fatalf("rollback status %v: %s", status, rec.Body)
+	}
+	fake.mu.Lock()
+	deleted := append([]string{}, fake.deleted...)
+	fake.mu.Unlock()
+	if len(deleted) != 1 || !strings.Contains(deleted[0], "services-1") {
+		t.Fatalf("expected the created service to be deleted, got %v", deleted)
+	}
+
+	// The rollback is itself a run, so it can be rolled back in turn.
+	rec, _ = do(t, h, http.MethodGet, "/api/connections/"+id+"/history", nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &history)
+	if len(history) != 2 {
+		t.Fatalf("the rollback should be recorded too: %s", rec.Body)
+	}
+	if !strings.Contains(fmt.Sprint(history[0]["actor"]), "rolled back") {
+		t.Errorf("history should say what it was: %v", history[0]["actor"])
+	}
+}
+
+func TestRollbackRefusesWhenKongMovedOn(t *testing.T) {
+	h := newTestServer(t)
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	do(t, h, http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	rec, _ := do(t, h, http.MethodGet, "/api/connections/"+id+"/history", nil)
+	var history []map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &history)
+	runID := history[0]["id"].(string)
+
+	// Somebody edited the service after that run.
+	fake.mu.Lock()
+	fake.services = []map[string]any{{"id": "services-1", "name": "billing", "host": "moved.internal", "port": float64(80)}}
+	fake.mu.Unlock()
+
+	rec, out := do(t, h, http.MethodPost, "/api/connections/"+id+"/history/"+runID+"/rollback", nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when the entity drifted, got %d %s", rec.Code, rec.Body)
+	}
+	if conflicts := out["plan"].(map[string]any)["conflicts"].([]any); len(conflicts) != 1 {
+		t.Fatalf("the refusal must say what is in the way: %v", out["plan"])
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.deleted) != 0 {
+		t.Fatalf("a refused rollback must not touch Kong: %v", fake.deleted)
+	}
+}
+
+func TestOnlyAnApproverCanRollBack(t *testing.T) {
+	h := newTestServerWith(t, Approval{Approvers: []string{"alice"}})
+	fake := newFakeKong(t)
+	id := registerConnection(t, h, fake.srv.URL)
+
+	// Alice applies, so there is something to undo.
+	asActor(t, h, "alice", "", http.MethodPost, "/api/connections/"+id+"/apply", desiredWithOneService("billing"))
+	rec, _ := asActor(t, h, "alice", "", http.MethodGet, "/api/connections/"+id+"/history", nil)
+	var history []map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &history)
+	runID := history[0]["id"].(string)
+	path := "/api/connections/" + id + "/history/" + runID + "/rollback"
+
+	if rec, _ := asActor(t, h, "bob", "", http.MethodPost, path, nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for an editor, got %d %s", rec.Code, rec.Body)
+	}
+	// Reading what a rollback would do is safe for anyone.
+	if rec, _ := asActor(t, h, "bob", "", http.MethodGet, path, nil); rec.Code != http.StatusOK {
+		t.Fatalf("preview should be readable: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestRollbackOfAnotherKongsRunIsNotFound(t *testing.T) {
+	h := newTestServer(t)
+	fake := newFakeKong(t)
+	mine := registerConnection(t, h, fake.srv.URL)
+	other := registerConnection(t, h, fake.srv.URL)
+
+	do(t, h, http.MethodPost, "/api/connections/"+mine+"/apply", desiredWithOneService("billing"))
+	rec, _ := do(t, h, http.MethodGet, "/api/connections/"+mine+"/history", nil)
+	var history []map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &history)
+	runID := history[0]["id"].(string)
+
+	rec, _ = do(t, h, http.MethodGet, "/api/connections/"+other+"/history/"+runID+"/rollback", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("a run must not be reachable through another Kong: %d %s", rec.Code, rec.Body)
 	}
 }

@@ -9,43 +9,116 @@ import DiffPanel from './components/DiffPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
 import ImportDialog from './components/ImportDialog.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import RequestsPanel from './components/RequestsPanel.vue'
 import { useConnectionsStore } from './stores/connections'
 import { useGraphStore } from './stores/graph'
+import { useRequestsStore } from './stores/requests'
+import { useSessionStore } from './stores/session'
 import { openSocket } from './api/client'
 
 const connections = useConnectionsStore()
 const graph = useGraphStore()
+const requests = useRequestsStore()
+const session = useSessionStore()
 
 const canvas = ref(null)
 const connectionDialog = ref(null) // { connection } | null
 const showDiff = ref(false)
 const showHistory = ref(false)
 const showImport = ref(false)
+const showRequests = ref(false)
 const confirmDiscard = ref(false)
 const toast = ref(null)
 
 let socket = null
 let toastTimer = null
+// Whether this tab has already asked the others for the shared draft. Once per
+// Kong: asking again would pull back a draft the user has deliberately left.
+let askedForCanvas = false
 
-onMounted(() => connections.load())
+onMounted(async () => {
+  await session.init()
+  connections.load()
+})
 
-// Keep one socket open for the Kong currently on screen, for apply progress.
+// Keep one socket open for the Kong currently on screen: apply progress, who
+// else is here, and a nudge when somebody's change lands.
 watch(
   () => connections.activeId,
   (id) => {
     socket?.close()
     socket = null
+    session.detach()
+    askedForCanvas = false
     if (!id) {
       graph.reset()
+      requests.reset()
+      showRequests.value = false
       return
     }
     graph.load(id)
-    socket = openSocket(id, (msg) => {
-      if (msg.type === 'apply_progress') graph.recordApplyEvent(msg.payload)
-      if (msg.type === 'apply_started') graph.applyLog = []
-    })
+    requests.load(id)
+    socket = openSocket(id, { clientId: session.clientId, name: session.displayName }, onServerEvent)
+    socket.onopen = () => session.announce(graph.selectedNodeId)
+    session.attach(socket)
   },
   { immediate: true },
+)
+
+function onServerEvent(msg) {
+  switch (msg.type) {
+    case 'apply_started':
+      graph.applyLog = []
+      break
+    case 'apply_progress':
+      graph.recordApplyEvent(msg.payload)
+      break
+    case 'presence': {
+      session.setPeers(msg.payload?.peers)
+      // The first roster that shows somebody else already here is the moment to
+      // ask for the draft they have been building.
+      if (!askedForCanvas && session.others.length) askedForCanvas = session.requestCanvas()
+      break
+    }
+    case 'cursor':
+      session.applyCursor(msg.payload)
+      break
+    case 'node_move':
+      graph.applyRemotePosition(msg.payload)
+      break
+    case 'canvas_op':
+      graph.applyRemoteCanvasOp(msg.payload)
+      break
+    case 'state_request':
+      // Only the longest-serving tab answers, so a newcomer gets one copy.
+      if (session.answersCanvasRequests) session.sendCanvas(graph.canvasSnapshot())
+      break
+    case 'state_sync':
+      graph.applyStateSync(msg.payload)
+      break
+    case 'state_changed':
+      graph.noteRemoteChange(msg.payload)
+      break
+    case 'request_submitted':
+    case 'request_reviewed':
+      requests.upsert(msg.payload?.request)
+      if (msg.payload?.by !== session.clientId) {
+        graph.notify(
+          msg.type === 'request_submitted'
+            ? `${msg.payload?.actor ?? 'Somebody'} filed a change for approval`
+            : `${msg.payload?.actor ?? 'Somebody'} ${msg.payload?.request?.status ?? 'reviewed'} a change request`,
+          'info',
+        )
+      }
+      break
+  }
+}
+
+// Tell everyone else which node this browser has open, so two people do not
+// silently edit the same Service.
+watch(
+  () => graph.selectedNodeId,
+  (node) => session.announce(node),
 )
 
 watch(
@@ -60,13 +133,31 @@ watch(
 
 onUnmounted(() => {
   socket?.close()
+  session.detach()
   clearTimeout(toastTimer)
 })
+
+// refreshAfterRemoteChange takes the other person's version. Anything unapplied
+// on this canvas is a change the user still has, so it is worth saying so.
+async function refreshAfterRemoteChange() {
+  const dirty = graph.isDirty
+  graph.dismissRemoteChange()
+  if (dirty && !confirm('You have unapplied changes on this canvas. Reload from Kong and lose them?')) return
+  await graph.load(connections.activeId, { keepPositions: true })
+}
 
 function selectConnection(id) {
   if (id === connections.activeId) return
   if (graph.isDirty && !confirm('This workspace has unapplied changes. Switch anyway and lose them?')) return
   connections.select(id)
+}
+
+// Refresh is a deliberate "show me what Kong says". Since the draft is shared,
+// that has to reach the others too, or this tab would sit alone on Kong's state
+// while everyone else keeps the draft it just dropped.
+async function refresh() {
+  await graph.refresh()
+  session.sendCanvas(graph.canvasSnapshot())
 }
 
 async function review() {
@@ -128,14 +219,31 @@ const TOAST_STYLE = {
 
     <main class="flex min-w-0 flex-1 flex-col">
       <Toolbar
-        @refresh="graph.refresh()"
+        @refresh="refresh"
+        @undo="graph.undo()"
+        @redo="graph.redo()"
         @relayout="canvas?.relayout()"
         @review="review"
         @history="showHistory = true"
         @import="showImport = true"
         @export="exportDeck"
         @discard="confirmDiscard = true"
+        @requests="showRequests = true"
       />
+
+      <!-- Somebody else's change reached this Kong; this canvas is now stale. -->
+      <div
+        v-if="graph.remoteChange"
+        class="flex items-center gap-3 border-b border-sky-500/30 bg-sky-500/10 px-4 py-1.5 text-xs text-sky-200"
+      >
+        <span>
+          {{ graph.remoteChange.actor }} applied changes to this Kong — what you are looking at is out of date.
+        </span>
+        <button class="rounded border border-sky-400/40 px-2 py-0.5 hover:bg-sky-500/20" @click="refreshAfterRemoteChange">
+          Refresh
+        </button>
+        <button class="ml-auto text-sky-300/70 hover:text-sky-100" @click="graph.dismissRemoteChange()">✕</button>
+      </div>
 
       <div class="flex min-h-0 flex-1">
         <div class="relative min-w-0 flex-1">
@@ -173,6 +281,7 @@ const TOAST_STYLE = {
     />
     <DiffPanel v-if="showDiff" @close="showDiff = false" @focus-node="focusFromDiff" />
     <HistoryPanel v-if="showHistory" @close="showHistory = false" />
+    <RequestsPanel v-if="showRequests" @close="showRequests = false" />
     <ImportDialog v-if="showImport" @close="showImport = false" @import="importDeck" />
 
     <ConfirmDialog
